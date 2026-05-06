@@ -641,8 +641,8 @@ onUnmounted(stopMorphing)
 .app {
   --bg: #0a0a0f;
   --surface: #111118;
-  --surface2: #1a1a24;
-  --border: #2a2a38;
+  --surface2: #1a1a24a3;
+  --border: #2a2a3899;
   --text: #e0e0f0;
   --muted: #6b6b88;
   --accent: #8b5cf6;
@@ -698,8 +698,8 @@ onUnmounted(stopMorphing)
   width: var(--sidebar);
   flex-shrink: 0;
   background: rgba(17, 17, 24, 0.6);
-  backdrop-filter: blur(24px) saturate(1.6);
-  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+  backdrop-filter: blur(40px) saturate(1.6);
+  -webkit-backdrop-filter: blur(40px) saturate(1.6);
   border-left: 1px solid rgba(255, 255, 255, 0.06);
   display: flex;
   flex-direction: column;
@@ -1204,10 +1204,12 @@ onUnmounted(stopMorphing)
     left: 0;
     right: 0;
     height: 64px;
-    background: rgba(17, 17, 24, 0.85);
+    background: rgb(0 0 0 / 25%);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     border-top: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+    margin: 8px;
     padding: 10px 12px;
     gap: 8px;
     align-items: center;
