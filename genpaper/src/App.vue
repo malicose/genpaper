@@ -5,7 +5,21 @@ interface Layer { w: number[][]; b: number[] }
 type Rng = () => number
 
 // --- Settings ---
-const activation = ref<'tanh' | 'sin' | 'cos' | 'softplus' | 'sinc' | 'gaussian' | 'swish' | 'sech' | 'arctan' | 'fract'>('tanh')
+type Activation = 'smooth' | 'wave' | 'drift' | 'soft' | 'ring' | 'glow' | 'bend' | 'bell' | 'slope'
+const ACT_CODES: Record<Activation, string> = {
+  smooth: 'return tanh(x);',
+  wave:   'return sin(x);',
+  drift:  'return cos(x);',
+  soft:   'return x>20.?x:log(1.+exp(x));',
+  ring:   'return x==0.?1.:sin(x)/x;',
+  glow:   'return exp(-x*x);',
+  bend:   'return x/(1.+exp(-x));',
+  bell:   'return 2./(exp(x)+exp(-x));',
+  slope:  'return atan(x);',
+}
+const activation  = ref<Activation>('smooth')
+const activation2 = ref<Activation>('wave')
+const dualActivation = ref(false)
 const layerCount = ref(3)
 const colorMode = ref<'rgb' | 'bw' | 'palette'>('rgb')
 const stops = ref(['#0d0221', '#9b1d6b', '#f5a623'])
@@ -191,18 +205,8 @@ function makeFragSrc(layers: Layer[]): string {
   for (let l = 0; l < N; l++)
     offsets.push(offsets[l]! + sizes[l]! * sizes[l + 1]! + sizes[l + 1]!)
 
-  const actCode = {
-    tanh:     'return tanh(x);',
-    sin:      'return sin(x);',
-    cos:      'return cos(x);',
-    softplus: 'return x>20.?x:log(1.+exp(x));',
-    sinc:     'return x==0.?1.:sin(x)/x;',
-    gaussian: 'return exp(-x*x);',
-    swish:    'return x/(1.+exp(-x));',
-    sech:     'return 2./(exp(x)+exp(-x));',
-    arctan:   'return atan(x);',
-    fract:    'return fract(x);',
-  }[activation.value]
+  const actCode1 = ACT_CODES[activation.value]
+  const actCode2 = ACT_CODES[activation2.value]
 
   let fwd = `float inp[${sizes[0]}];
   inp[0]=x;inp[1]=y;inp[2]=r;
@@ -212,7 +216,7 @@ function makeFragSrc(layers: Layer[]): string {
     const inSz = sizes[l]!, outSz = sizes[l + 1]!
     const wOff = offsets[l]!, bOff = wOff + inSz * outSz
     const prev = l === 0 ? 'inp' : `h${l - 1}`
-    const fn   = l === N - 1 ? 'sig' : 'act'
+    const fn   = l === N - 1 ? 'sig' : (dualActivation.value && l % 2 !== 0 ? 'act2' : 'act1')
     fwd += `float h${l}[${outSz}];
   for(int o=0;o<${outSz};o++){
     float s=W(${bOff}+o);
@@ -251,7 +255,8 @@ uniform float u_z[8];
 uniform float u_grain;
 ${paletteUniforms}
 float W(int i){return texelFetch(u_w,ivec2(i%u_ts,i/u_ts),0).r;}
-float act(float x){${actCode}}
+float act1(float x){${actCode1}}
+float act2(float x){${actCode2}}
 float sig(float x){return 1./(1.+exp(-x));}
 float noise(vec2 p){return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453);}
 ${paletteFn}
@@ -439,7 +444,11 @@ function removeStop(i: number) {
   if (stops.value.length > 2) stops.value.splice(i, 1)
 }
 
-watch(colorMode, generate)
+watch(colorMode, () => { morphingEnabled.value ? (stopMorphing(), startMorphing()) : generate() })
+watch([activation, activation2, layerCount, dualActivation], () => {
+  if (morphingEnabled.value) { stopMorphing(); startMorphing() }
+  else if (hasGenerated.value) { buildProgram(currentWeights); draw(currentZ); captureBg() }
+})
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 watch([grainEnabled, grainLevel], () => { if (!animating) draw(currentZ) })
 watch(aspectRatio, generate, { flush: 'post' })
@@ -485,24 +494,42 @@ onUnmounted(stopMorphing)
 
       <div class="sidebar-body">
         <section class="group">
-          <div class="group-title">Network</div>
+          <div class="group-title">Shape</div>
           <div class="field">
-            <div class="field-label">Activation</div>
+            <div class="field-label">
+              Style
+              <button class="act-add-btn" @click="dualActivation = !dualActivation" :title="dualActivation ? 'Remove blend' : 'Add blend'">{{ dualActivation ? '−' : '+' }}</button>
+            </div>
             <select v-model="activation" class="select">
-              <option value="tanh">tanh</option>
-              <option value="sin">sin</option>
-              <option value="cos">cos</option>
-              <option value="softplus">softplus</option>
-              <option value="sinc">sinc</option>
-              <option value="gaussian">gaussian</option>
-              <option value="swish">swish</option>
-              <option value="sech">sech</option>
-              <option value="arctan">arctan</option>
-              <option value="fract">fract</option>
+              <option value="smooth">smooth</option>
+              <option value="wave">wave</option>
+              <option value="drift">drift</option>
+              <option value="soft">soft</option>
+              <option value="ring">ring</option>
+              <option value="glow">glow</option>
+              <option value="bend">bend</option>
+              <option value="bell">bell</option>
+              <option value="slope">slope</option>
             </select>
           </div>
+          <Transition name="fade">
+            <div v-if="dualActivation" class="field">
+              <div class="field-label">Blend</div>
+              <select v-model="activation2" class="select">
+                <option value="smooth">smooth</option>
+                <option value="wave">wave</option>
+                <option value="drift">drift</option>
+                <option value="soft">soft</option>
+                <option value="ring">ring</option>
+                <option value="glow">glow</option>
+                <option value="bend">bend</option>
+                <option value="bell">bell</option>
+                <option value="slope">slope</option>
+                </select>
+            </div>
+          </Transition>
           <div class="field">
-            <div class="field-label">Layers <span class="field-value">{{ layerCount }}</span></div>
+            <div class="field-label">Depth <span class="field-value">{{ layerCount }}</span></div>
             <input type="range" v-model.number="layerCount" min="1" max="8" class="slider" />
           </div>
         </section>
@@ -753,6 +780,27 @@ onUnmounted(stopMorphing)
   font-variant-numeric: tabular-nums;
   font-size: 12px;
 }
+
+.act-add-btn {
+  margin-left: auto;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.act-add-btn:hover { border-color: var(--accent); color: var(--accent); }
 
 /* ── Select ── */
 .select {
