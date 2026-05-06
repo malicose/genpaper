@@ -357,120 +357,570 @@ onUnmounted(stopMorphing)
 
 <template>
   <div class="app">
-    <canvas ref="canvas" :width="canvasW" :height="canvasH" />
+    <main class="canvas-wrap">
+      <canvas ref="canvas" :width="canvasW" :height="canvasH" class="canvas" />
+    </main>
 
-    <div class="controls">
-      <label>
-        Activation
-        <select v-model="activation">
-          <option value="tanh">tanh</option>
-          <option value="sin">sin</option>
-          <option value="cos">cos</option>
-
-          <option value="softplus">softplus</option>
-        </select>
-      </label>
-
-      <label>
-        Layers: {{ layerCount }}
-        <input type="range" v-model.number="layerCount" min="1" max="8" />
-      </label>
-
-      <label>
-        Color
-        <select v-model="colorMode">
-          <option value="rgb">RGB</option>
-          <option value="bw">B&amp;W</option>
-          <option value="palette">Palette</option>
-        </select>
-      </label>
-
-      <div v-if="colorMode === 'palette'" class="stop-row">
-        <span>Colors</span>
-        <div v-for="(_, i) in stops" :key="i" class="stop">
-          <input type="color" v-model="stops[i]" />
-          <button class="remove" @click="removeStop(i)" :disabled="stops.length <= 2">×</button>
-        </div>
-        <button @click="addStop" :disabled="stops.length >= MAX_STOPS">+</button>
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span class="logo">GenPaper</span>
       </div>
 
-      <label>
-        <input type="checkbox" v-model="seedEnabled" />
-        Seed
-        <input type="number" v-model.number="seedValue" :disabled="!seedEnabled" style="width:64px" />
-      </label>
+      <div class="sidebar-body">
+        <section class="group">
+          <div class="group-title">Network</div>
+          <div class="field">
+            <div class="field-label">Activation</div>
+            <select v-model="activation" class="select">
+              <option value="tanh">tanh</option>
+              <option value="sin">sin</option>
+              <option value="cos">cos</option>
+              <option value="softplus">softplus</option>
+            </select>
+          </div>
+          <div class="field">
+            <div class="field-label">Layers <span class="field-value">{{ layerCount }}</span></div>
+            <input type="range" v-model.number="layerCount" min="1" max="8" class="slider" />
+          </div>
+        </section>
 
-      <label>
-        <input type="checkbox" v-model="morphingEnabled" />
-        Morph
-      </label>
+        <section class="group">
+          <div class="group-title">Color</div>
+          <div class="segment-control">
+            <button :class="['seg-btn', colorMode === 'rgb' && 'active']" @click="colorMode = 'rgb'">RGB</button>
+            <button :class="['seg-btn', colorMode === 'bw' && 'active']" @click="colorMode = 'bw'">B&amp;W</button>
+            <button :class="['seg-btn', colorMode === 'palette' && 'active']" @click="colorMode = 'palette'">Palette</button>
+          </div>
+          <div v-if="colorMode === 'palette'" class="stop-row">
+            <div v-for="(_, i) in stops" :key="i" class="stop">
+              <input type="color" v-model="stops[i]" class="color-swatch" />
+              <button class="stop-remove" @click="removeStop(i)" :disabled="stops.length <= 2">×</button>
+            </div>
+            <button class="stop-add" @click="addStop" :disabled="stops.length >= MAX_STOPS">+</button>
+          </div>
+        </section>
 
-      <label>
-        <input type="checkbox" v-model="grainEnabled" />
-        Grain
-        <input type="range" v-model.number="grainLevel" min="0.02" max="0.5" step="0.01" :disabled="!grainEnabled" />
-      </label>
+        <section class="group">
+          <div class="group-title">Effects</div>
+          <div class="field row">
+            <div class="field-label">Grain</div>
+            <div class="toggle-wrap">
+              <input type="checkbox" v-model="grainEnabled" id="grain-toggle" class="toggle-input" />
+              <label for="grain-toggle" class="toggle"></label>
+            </div>
+          </div>
+          <Transition name="fade">
+            <div v-if="grainEnabled" class="field">
+              <div class="field-label">Level <span class="field-value">{{ grainLevel.toFixed(2) }}</span></div>
+              <input type="range" v-model.number="grainLevel" min="0.02" max="0.5" step="0.01" class="slider" />
+            </div>
+          </Transition>
+          <div class="field row">
+            <div class="field-label">Morph</div>
+            <div class="toggle-wrap">
+              <input type="checkbox" v-model="morphingEnabled" id="morph-toggle" class="toggle-input" />
+              <label for="morph-toggle" class="toggle"></label>
+            </div>
+          </div>
+        </section>
 
-      <label>
-        Ratio
-        <select v-model="aspectRatio">
-          <option value="1:1">1:1</option>
-          <option value="16:9">16:9</option>
-          <option value="9:16">9:16</option>
-        </select>
-      </label>
+        <section class="group">
+          <div class="group-title">Options</div>
+          <div class="field">
+            <div class="field-label">Aspect ratio</div>
+            <div class="ratio-btns">
+              <button :class="['ratio-btn', aspectRatio === '1:1' && 'active']" @click="aspectRatio = '1:1'" title="1:1">
+                <svg viewBox="0 0 16 16" width="16" height="16"><rect x="2" y="2" width="12" height="12" rx="1.5" fill="currentColor"/></svg>
+              </button>
+              <button :class="['ratio-btn', aspectRatio === '16:9' && 'active']" @click="aspectRatio = '16:9'" title="16:9">
+                <svg viewBox="0 0 16 16" width="16" height="16"><rect x="1" y="4" width="14" height="8" rx="1.5" fill="currentColor"/></svg>
+              </button>
+              <button :class="['ratio-btn', aspectRatio === '9:16' && 'active']" @click="aspectRatio = '9:16'" title="9:16">
+                <svg viewBox="0 0 16 16" width="16" height="16"><rect x="4" y="1" width="8" height="14" rx="1.5" fill="currentColor"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="field row">
+            <div class="field-label">Seed</div>
+            <div class="toggle-wrap">
+              <input type="checkbox" v-model="seedEnabled" id="seed-toggle" class="toggle-input" />
+              <label for="seed-toggle" class="toggle"></label>
+            </div>
+          </div>
+          <Transition name="fade">
+            <div v-if="seedEnabled" class="field">
+              <input type="number" v-model.number="seedValue" class="number-input" />
+            </div>
+          </Transition>
+        </section>
+      </div>
 
-      <button @click="restorePrev" :disabled="!hasPrev || morphingEnabled">Back</button>
-      <button @click="generate" :disabled="generating || morphingEnabled">
-        {{ generating ? 'Generating…' : 'Generate' }}
-      </button>
-      <button @click="download" :disabled="!hasGenerated">Download</button>
-    </div>
+      <div class="actions">
+        <div class="actions-row">
+          <button class="btn-secondary" @click="restorePrev" :disabled="!hasPrev || morphingEnabled">↩ Back</button>
+          <button class="btn-secondary" @click="download" :disabled="!hasGenerated">↓ Download</button>
+        </div>
+        <button class="btn-generate" @click="generate" :disabled="generating || morphingEnabled">
+          <span v-if="generating" class="spinner"></span>
+          {{ generating ? 'Generating…' : 'Generate' }}
+        </button>
+      </div>
+    </aside>
   </div>
 </template>
 
 <style scoped>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
 .app {
+  --bg: #0a0a0f;
+  --surface: #111118;
+  --surface2: #1a1a24;
+  --border: #2a2a38;
+  --text: #e0e0f0;
+  --muted: #6b6b88;
+  --accent: #8b5cf6;
+  --accent-dim: rgba(139, 92, 246, 0.15);
+  --accent-hover: #9d76f8;
+  --radius: 8px;
+  --radius-sm: 5px;
+  --sidebar: 260px;
+
+  display: flex;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  font-size: 14px;
+}
+
+/* ── Canvas ── */
+.canvas-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.canvas {
+  max-width: 100%;
+  max-height: calc(100vh - 64px);
+  width: auto;
+  height: auto;
+  border-radius: var(--radius);
+  box-shadow: 0 0 80px rgba(139, 92, 246, 0.1), 0 8px 40px rgba(0, 0, 0, 0.7);
+  display: block;
+}
+
+/* ── Sidebar ── */
+.sidebar {
+  width: var(--sidebar);
+  flex-shrink: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 20px;
-  padding: 24px;
+  height: 100vh;
+  position: sticky;
+  top: 0;
 }
-canvas { border: 1px solid #ccc; }
-.controls {
+
+.sidebar-header {
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.logo {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  background: linear-gradient(135deg, #a78bfa 0%, #ec4899 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.sidebar-body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.sidebar-body::-webkit-scrollbar { width: 3px; }
+.sidebar-body::-webkit-scrollbar-track { background: transparent; }
+.sidebar-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ── Groups ── */
+.group {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.group-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+
+/* ── Fields ── */
+.field {
+  margin-bottom: 12px;
+}
+
+.field:last-child { margin-bottom: 0; }
+
+.field.row {
   display: flex;
   align-items: center;
-  gap: 20px;
-  flex-wrap: wrap;
-  justify-content: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
 }
-label { display: flex; align-items: center; gap: 6px; font-size: 14px; }
-select, button, input[type='number'] { padding: 5px 10px; font-size: 14px; cursor: pointer; }
-button:disabled { opacity: 0.4; cursor: default; }
 
+.field-label {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 7px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field.row .field-label { margin-bottom: 0; }
+
+.field-value {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+/* ── Select ── */
+.select {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 28px 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  cursor: pointer;
+  outline: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b6b88'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  transition: border-color 0.15s;
+}
+
+.select:focus { border-color: var(--accent); }
+
+/* ── Slider ── */
+.slider {
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  cursor: pointer;
+  outline: none;
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+  transition: box-shadow 0.15s;
+}
+
+.slider::-webkit-slider-thumb:hover { box-shadow: 0 0 0 5px var(--accent-dim); }
+
+.slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+}
+
+/* ── Segment control ── */
+.segment-control {
+  display: flex;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.seg-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 6px 4px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.seg-btn:hover:not(.active) { color: var(--text); }
+
+.seg-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ── Color stops ── */
 .stop-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 14px;
+  flex-wrap: wrap;
+  margin-top: 10px;
 }
-.stop {
+
+.stop { position: relative; }
+
+.color-swatch {
+  display: block;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  background: none;
+}
+
+.stop-remove {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 2px;
-}
-.stop input[type='color'] {
-  width: 32px;
-  height: 32px;
+  justify-content: center;
   padding: 0;
-  border: none;
-  cursor: pointer;
-  border-radius: 4px;
+  transition: all 0.15s;
 }
-.remove {
-  padding: 2px 5px;
+
+.stop-remove:hover:not(:disabled) { border-color: #f87171; color: #f87171; }
+.stop-remove:disabled { opacity: 0.25; cursor: default; }
+
+.stop-add {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: all 0.15s;
+}
+
+.stop-add:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.stop-add:disabled { opacity: 0.25; cursor: default; }
+
+/* ── Toggle ── */
+.toggle-wrap { display: flex; align-items: center; }
+
+.toggle-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle {
+  display: block;
+  width: 34px;
+  height: 18px;
+  background: var(--border);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 0.2s;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.toggle::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform 0.2s, background 0.2s;
+}
+
+.toggle-input:checked + .toggle { background: var(--accent); }
+.toggle-input:checked + .toggle::after { transform: translateX(16px); background: #fff; }
+
+/* ── Ratio buttons ── */
+.ratio-btns { display: flex; gap: 6px; }
+
+.ratio-btn {
+  width: 36px;
+  height: 36px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  transition: all 0.15s;
+  padding: 0;
+}
+
+.ratio-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
+
+.ratio-btn.active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── Number input ── */
+.number-input {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.number-input:focus { border-color: var(--accent); }
+
+/* ── Actions ── */
+.actions {
+  padding: 16px 20px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.actions-row { display: flex; gap: 8px; }
+
+.btn-secondary {
+  flex: 1;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
   font-size: 12px;
-  line-height: 1;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.btn-secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.btn-secondary:disabled { opacity: 0.3; cursor: default; }
+
+.btn-generate {
+  width: 100%;
+  background: var(--accent);
+  border: none;
+  color: #fff;
+  padding: 11px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  letter-spacing: 0.1px;
+}
+
+.btn-generate:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-generate:disabled { opacity: 0.45; cursor: default; }
+
+/* ── Spinner ── */
+.spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.65s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Fade transition ── */
+.fade-enter-active, .fade-leave-active { transition: opacity 0.15s, transform 0.15s; }
+.fade-enter-from, .fade-leave-to { opacity: 0; transform: translateY(-4px); }
+
+/* ── Mobile ── */
+@media (max-width: 767px) {
+  .app { flex-direction: column; }
+
+  .canvas-wrap {
+    padding: 16px 16px 12px;
+    flex: none;
+  }
+
+  .canvas { max-height: 55vw; }
+
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: static;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+
+  .sidebar-header { padding: 14px 16px 12px; }
+
+  .sidebar-body { overflow-y: visible; }
+
+  .group { padding: 14px 16px; }
+
+  .actions { padding: 14px 16px; }
+}
+
+@media (max-width: 400px) {
+  .canvas { max-height: 70vw; }
 }
 </style>
