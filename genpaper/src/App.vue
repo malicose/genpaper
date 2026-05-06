@@ -29,6 +29,85 @@ const canvas = ref<HTMLCanvasElement | null>(null)
 const generating = ref(false)
 const hasGenerated = ref(false)
 const bgUrl = ref('')
+const accentColor = ref('#8b5cf6')
+const accentColor2 = ref('#ec4899')
+
+// --- Color extraction ---
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b)
+  const l = (max + min) / 2
+  if (max === min) return [0, 0, l]
+  const d = max - min
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
+  let h: number
+  if (max === r)      h = ((g - b) / d + (g < b ? 6 : 0)) / 6
+  else if (max === g) h = ((b - r) / d + 2) / 6
+  else                h = ((r - g) / d + 4) / 6
+  return [h * 360, s, l]
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const c = (1 - Math.abs(2 * l - 1)) * s
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1))
+  const m = l - c / 2
+  let r: number, g: number, b: number
+  if      (h < 60)  { r = c; g = x; b = 0 }
+  else if (h < 120) { r = x; g = c; b = 0 }
+  else if (h < 180) { r = 0; g = c; b = x }
+  else if (h < 240) { r = 0; g = x; b = c }
+  else if (h < 300) { r = x; g = 0; b = c }
+  else              { r = c; g = 0; b = x }
+  const hex = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, '0')
+  return `#${hex(r)}${hex(g)}${hex(b)}`
+}
+
+function wcagLuminance(r: number, g: number, b: number): number {
+  const lin = (c: number) => c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+function withWhiteContrast(h: number, s: number, l: number): string {
+  // Darken until contrast ratio with white ≥ 4.0
+  while (l > 0.05) {
+    const hex = hslToHex(h, s, l)
+    const n = parseInt(hex.slice(1), 16)
+    const lum = wcagLuminance((n >> 16) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255)
+    if (1.05 / (lum + 0.05) >= 4.0) return hex
+    l -= 0.02
+  }
+  return hslToHex(h, s, l)
+}
+
+function extractAccent() {
+  const src = canvas.value!
+  const tmp = document.createElement('canvas')
+  tmp.width = 48; tmp.height = 48
+  const ctx = tmp.getContext('2d')!
+  ctx.drawImage(src, 0, 0, 48, 48)
+  const { data } = ctx.getImageData(0, 0, 48, 48)
+
+  let rAcc = 0, gAcc = 0, bAcc = 0, wTotal = 0
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i]! / 255, g = data[i + 1]! / 255, b = data[i + 2]! / 255
+    const max = Math.max(r, g, b)
+    const sat = max === 0 ? 0 : (max - Math.min(r, g, b)) / max
+    const w = sat * sat
+    rAcc += r * w; gAcc += g * w; bAcc += b * w; wTotal += w
+  }
+
+  if (colorMode.value === 'bw') {
+    accentColor.value  = withWhiteContrast(0, 0, 0.6)
+    accentColor2.value = withWhiteContrast(0, 0, 0.75)
+    return
+  }
+
+  if (wTotal < 0.1) return  // near-greyscale, keep current accent
+
+  const r = rAcc / wTotal, g = gAcc / wTotal, b = bAcc / wTotal
+  const [h, s] = rgbToHsl(r, g, b)
+  accentColor.value  = withWhiteContrast(h, Math.max(s, 0.65), 0.6)
+  accentColor2.value = withWhiteContrast((h + 38) % 360, Math.max(s, 0.65), 0.6)
+}
 
 let gl: WebGL2RenderingContext | null = null
 let vs: WebGLShader | null = null
@@ -251,6 +330,7 @@ function draw(z: number[]) {
 
 function captureBg() {
   bgUrl.value = canvas.value!.toDataURL('image/jpeg', 0.6)
+  extractAccent()
 }
 
 // --- Generate ---
@@ -356,14 +436,19 @@ function removeStop(i: number) {
 watch(colorMode, generate)
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 watch([grainEnabled, grainLevel], () => { if (!animating) draw(currentZ) })
-watch(aspectRatio, () => { if (!animating) draw(currentZ) })
+watch(aspectRatio, generate, { flush: 'post' })
 watch(stops, () => { if (!animating) draw(currentZ) }, { deep: true })
 onMounted(() => { initGL(); generate() })
 onUnmounted(stopMorphing)
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :style="{
+    '--accent': accentColor,
+    '--accent2': accentColor2,
+    '--accent-dim': accentColor + '26',
+    '--accent-hover': accentColor + 'dd',
+  }">
     <div v-if="bgUrl" class="bg-blur" :style="{ backgroundImage: `url(${bgUrl})` }" />
     <main class="canvas-wrap">
       <canvas ref="canvas" :width="canvasW" :height="canvasH" class="canvas" />
@@ -371,7 +456,7 @@ onUnmounted(stopMorphing)
 
     <aside class="sidebar">
       <div class="sidebar-header">
-        <span class="logo">GenPaper</span>
+        <span class="logo" :style="{ backgroundImage: `linear-gradient(135deg, ${accentColor} 0%, ${accentColor2} 100%)` }">GenPaper</span>
       </div>
 
       <div class="sidebar-body">
@@ -561,10 +646,10 @@ onUnmounted(stopMorphing)
   font-size: 17px;
   font-weight: 700;
   letter-spacing: -0.3px;
-  background: linear-gradient(135deg, #a78bfa 0%, #ec4899 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
+  transition: background-image 0.6s ease;
 }
 
 .sidebar-body {
@@ -711,7 +796,7 @@ onUnmounted(stopMorphing)
 .stop-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
   flex-wrap: wrap;
   margin-top: 10px;
 }
@@ -720,8 +805,8 @@ onUnmounted(stopMorphing)
 
 .color-swatch {
   display: block;
-  width: 28px;
-  height: 28px;
+  width: 36px;
+  height: 36px;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -731,15 +816,15 @@ onUnmounted(stopMorphing)
 
 .stop-remove {
   position: absolute;
-  top: -5px;
-  right: -5px;
-  width: 14px;
-  height: 14px;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
   background: var(--surface);
   border: 1px solid var(--border);
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1;
   cursor: pointer;
   display: flex;
@@ -753,13 +838,13 @@ onUnmounted(stopMorphing)
 .stop-remove:disabled { opacity: 0.25; cursor: default; }
 
 .stop-add {
-  width: 28px;
-  height: 28px;
+  width: 36px;
+  height: 36px;
   border-radius: var(--radius-sm);
   background: transparent;
   border: 1px dashed var(--border);
   color: var(--muted);
-  font-size: 16px;
+  font-size: 18px;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -912,6 +997,13 @@ onUnmounted(stopMorphing)
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Accent transitions ── */
+.btn-generate,
+.seg-btn.active,
+.toggle-input:checked + .toggle,
+.ratio-btn.active,
+.slider::-webkit-slider-thumb { transition: background 0.5s ease, border-color 0.5s ease; }
+
 /* ── Fade transition ── */
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s, transform 0.15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; transform: translateY(-4px); }
@@ -942,6 +1034,12 @@ onUnmounted(stopMorphing)
   .group { padding: 14px 16px; }
 
   .actions { padding: 14px 16px; }
+
+  .color-swatch { width: 48px; height: 48px; }
+
+  .stop-add { width: 48px; height: 48px; font-size: 22px; }
+
+  .stop-remove { width: 22px; height: 22px; font-size: 13px; top: -7px; right: -7px; }
 }
 
 @media (max-width: 400px) {
