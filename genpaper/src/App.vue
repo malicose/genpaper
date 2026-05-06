@@ -28,6 +28,7 @@ const MAX_STOPS = 6
 const canvas = ref<HTMLCanvasElement | null>(null)
 const generating = ref(false)
 const hasGenerated = ref(false)
+const bgUrl = ref('')
 
 let gl: WebGL2RenderingContext | null = null
 let vs: WebGLShader | null = null
@@ -191,7 +192,7 @@ function compileShader(type: number, src: string): WebGLShader {
 }
 
 function initGL() {
-  const g = canvas.value!.getContext('webgl2')
+  const g = canvas.value!.getContext('webgl2', { preserveDrawingBuffer: true })
   if (!g) { alert('WebGL 2 not supported in this browser'); return }
   gl = g
   vs = compileShader(g.VERTEX_SHADER,
@@ -248,6 +249,10 @@ function draw(z: number[]) {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
 }
 
+function captureBg() {
+  bgUrl.value = canvas.value!.toDataURL('image/jpeg', 0.6)
+}
+
 // --- Generate ---
 function generate() {
   stopMorphing()
@@ -262,6 +267,7 @@ function generate() {
     currentZ = makeZ(rng)
     currentWeights = weights
     draw(currentZ)
+    captureBg()
     generating.value = false
     hasGenerated.value = true
   }, 10)
@@ -336,6 +342,7 @@ function restorePrev() {
   uploadWeights(currentWeights)
   buildProgram(currentWeights)
   draw(currentZ)
+  captureBg()
 }
 
 // --- Add / remove stops ---
@@ -357,6 +364,7 @@ onUnmounted(stopMorphing)
 
 <template>
   <div class="app">
+    <div v-if="bgUrl" class="bg-blur" :style="{ backgroundImage: `url(${bgUrl})` }" />
     <main class="canvas-wrap">
       <canvas ref="canvas" :width="canvasW" :height="canvasH" class="canvas" />
     </main>
@@ -494,6 +502,17 @@ onUnmounted(stopMorphing)
   font-size: 14px;
 }
 
+/* ── Background blur ── */
+.bg-blur {
+  position: fixed;
+  inset: -5%;
+  background-size: cover;
+  background-position: center;
+  filter: blur(90px) brightness(0.22) saturate(1.4);
+  z-index: 0;
+  pointer-events: none;
+}
+
 /* ── Canvas ── */
 .canvas-wrap {
   flex: 1;
@@ -502,6 +521,8 @@ onUnmounted(stopMorphing)
   align-items: center;
   justify-content: center;
   padding: 32px;
+  position: relative;
+  z-index: 1;
 }
 
 .canvas {
@@ -518,18 +539,21 @@ onUnmounted(stopMorphing)
 .sidebar {
   width: var(--sidebar);
   flex-shrink: 0;
-  background: var(--surface);
-  border-left: 1px solid var(--border);
+  background: rgba(17, 17, 24, 0.6);
+  backdrop-filter: blur(24px) saturate(1.6);
+  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
   display: flex;
   flex-direction: column;
   height: 100vh;
   position: sticky;
   top: 0;
+  z-index: 1;
 }
 
 .sidebar-header {
   padding: 18px 20px 16px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   flex-shrink: 0;
 }
 
@@ -556,7 +580,7 @@ onUnmounted(stopMorphing)
 /* ── Groups ── */
 .group {
   padding: 16px 20px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .group-title {
@@ -828,7 +852,7 @@ onUnmounted(stopMorphing)
 /* ── Actions ── */
 .actions {
   padding: 16px 20px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -908,7 +932,7 @@ onUnmounted(stopMorphing)
     height: auto;
     position: static;
     border-left: none;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
   }
 
   .sidebar-header { padding: 14px 16px 12px; }
