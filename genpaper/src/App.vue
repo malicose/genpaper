@@ -1123,7 +1123,7 @@ onUnmounted(stopMorphing)
     flex: none;
   }
 
-  .canvas { max-height: 60vw; }
+  .canvas { max-height: 100vw; }
 
   /* Sidebar becomes a bottom sheet */
   .sidebar {
