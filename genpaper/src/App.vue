@@ -5,9 +5,10 @@ interface Layer { w: number[][]; b: number[] }
 type Rng = () => number
 
 // --- Settings ---
-const activation = ref<'tanh' | 'sin' | 'cos' | 'abs' | 'gaussian' | 'sinc' | 'softplus'>('tanh')
+const activation = ref<'tanh' | 'sin' | 'cos' | 'softplus'>('tanh')
 const layerCount = ref(3)
-const colorMode = ref<'rgb' | 'bw'>('rgb')
+const colorMode = ref<'rgb' | 'bw' | 'palette'>('rgb')
+const stops = ref(['#0d0221', '#9b1d6b', '#f5a623'])
 
 const seedEnabled = ref(false)
 const seedValue = ref(42)
@@ -20,6 +21,8 @@ const DISPLAY = { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] } as
 const EXPORT  = { '1:1': [3840, 3840], '16:9': [3840, 2160], '9:16': [2160, 3840] } as const
 const canvasW = computed(() => DISPLAY[aspectRatio.value][0])
 const canvasH = computed(() => DISPLAY[aspectRatio.value][1])
+
+const MAX_STOPS = 6
 
 // --- Runtime state ---
 const canvas = ref<HTMLCanvasElement | null>(null)
@@ -72,7 +75,7 @@ function lerpZ(a: number[], b: number[], t: number): number[] {
 }
 function smoothstep(t: number) { return t * t * (3 - 2 * t) }
 
-// --- Pack weights into a flat Float32Array ---
+// --- Pack weights ---
 function packWeights(layers: Layer[]): Float32Array {
   const count = layers.reduce((s, l) => s + l.w.length * l.w[0]!.length + l.b.length, 0)
   const data = new Float32Array(count)
@@ -84,27 +87,34 @@ function packWeights(layers: Layer[]): Float32Array {
   return data
 }
 
+// --- Color stops → flat Float32Array for uniform vec3[MAX_STOPS] ---
+function hexToRgb(hex: string): [number, number, number] {
+  const n = parseInt(hex.slice(1), 16)
+  return [(n >> 16) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255]
+}
+function stopsFlat(): Float32Array {
+  const out = new Float32Array(MAX_STOPS * 3)
+  stops.value.forEach((hex, i) => {
+    const [r, g, b] = hexToRgb(hex)
+    out[i * 3] = r; out[i * 3 + 1] = g; out[i * 3 + 2] = b
+  })
+  return out
+}
+
 // --- Dynamic GLSL fragment shader ---
-// The shader is generated from the layer architecture so all loop bounds
-// are compile-time integer literals — valid in GLSL ES 3.00.
 function makeFragSrc(layers: Layer[]): string {
-  const outSize = colorMode.value === 'rgb' ? 3 : 1
   const sizes = [11, ...layers.map(l => l.b.length)]
   const N = layers.length
 
-  // Weight offsets per layer [w0 ... wN, b0 ... bN] packed contiguously
   const offsets: number[] = [0]
-  for (let l = 0; l < N; l++) {
+  for (let l = 0; l < N; l++)
     offsets.push(offsets[l]! + sizes[l]! * sizes[l + 1]! + sizes[l + 1]!)
-  }
 
   const actCode = {
     tanh:     'return tanh(x);',
     sin:      'return sin(x);',
     cos:      'return cos(x);',
-    abs:      'return abs(x);',
-    gaussian: 'return exp(-x*x);',
-    sinc:     'return x==0.?1.:sin(x)/x;',
+
     softplus: 'return x>20.?x:log(1.+exp(x));',
   }[activation.value]
 
@@ -113,12 +123,10 @@ function makeFragSrc(layers: Layer[]): string {
   for(int i=0;i<8;i++)inp[3+i]=u_z[i];
   `
   for (let l = 0; l < N; l++) {
-    const inSz  = sizes[l]!
-    const outSz = sizes[l + 1]!
-    const wOff  = offsets[l]!
-    const bOff  = wOff + inSz * outSz
-    const prev  = l === 0 ? 'inp' : `h${l - 1}`
-    const fn    = l === N - 1 ? 'sig' : 'act'
+    const inSz = sizes[l]!, outSz = sizes[l + 1]!
+    const wOff = offsets[l]!, bOff = wOff + inSz * outSz
+    const prev = l === 0 ? 'inp' : `h${l - 1}`
+    const fn   = l === N - 1 ? 'sig' : 'act'
     fwd += `float h${l}[${outSz}];
   for(int o=0;o<${outSz};o++){
     float s=W(${bOff}+o);
@@ -128,10 +136,24 @@ function makeFragSrc(layers: Layer[]): string {
   `
   }
 
+  const mode = colorMode.value
+  const paletteUniforms = mode === 'palette'
+    ? `uniform int u_nstops;\nuniform vec3 u_stops[${MAX_STOPS}];` : ''
+  const paletteFn = mode === 'palette' ? `
+vec3 palette(float t){
+  for(int i=0;i<u_nstops-1;i++){
+    float t0=float(i)/float(u_nstops-1);
+    float t1=float(i+1)/float(u_nstops-1);
+    if(t<=t1) return mix(u_stops[i],u_stops[i+1],(t-t0)/(t1-t0));
+  }
+  return u_stops[u_nstops-1];
+}` : ''
   const last = `h${N - 1}`
-  const colAssign = outSize === 3
+  const colLine = mode === 'rgb'
     ? `vec3 col=vec3(${last}[0],${last}[1],${last}[2]);`
-    : `vec3 col=vec3(${last}[0]);`
+    : mode === 'bw'
+    ? `vec3 col=vec3(${last}[0]);`
+    : `vec3 col=palette(${last}[0]);`
 
   return `#version 300 es
 precision highp float;
@@ -141,16 +163,18 @@ uniform int u_ts;
 uniform vec2 u_res;
 uniform float u_z[8];
 uniform float u_grain;
+${paletteUniforms}
 float W(int i){return texelFetch(u_w,ivec2(i%u_ts,i/u_ts),0).r;}
 float act(float x){${actCode}}
 float sig(float x){return 1./(1.+exp(-x));}
 float noise(vec2 p){return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453);}
+${paletteFn}
 void main(){
   vec2 c=gl_FragCoord.xy/u_res;
   float asp=u_res.x/u_res.y;
   float x=(c.x*2.-1.)*asp,y=(1.-c.y)*2.-1.,r=length(vec2(x,y));
   ${fwd}
-  ${colAssign}
+  ${colLine}
   float g=(noise(gl_FragCoord.xy)-0.5)*u_grain;
   fragColor=vec4(clamp(col+g,0.,1.),1.);
 }`
@@ -204,19 +228,27 @@ function uploadWeights(layers: Layer[]) {
   g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST)
 }
 
-function draw(z: number[]) {
-  if (!gl || !program) return
-  const g = gl, el = canvas.value!
-  g.viewport(0, 0, el.width, el.height)
-  g.uniform2f(g.getUniformLocation(program, 'u_res'), el.width, el.height)
-  g.uniform1i(g.getUniformLocation(program, 'u_ts'), texSize)
-  g.uniform1fv(g.getUniformLocation(program, 'u_z'), new Float32Array(z))
-  g.uniform1i(g.getUniformLocation(program, 'u_w'), 0)
-  g.uniform1f(g.getUniformLocation(program, 'u_grain'), grainEnabled.value ? grainLevel.value : 0.0)
-  g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+function setUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h: number, z: number[]) {
+  g.uniform2f(g.getUniformLocation(prog, 'u_res'), w, h)
+  g.uniform1i(g.getUniformLocation(prog, 'u_ts'), texSize)
+  g.uniform1fv(g.getUniformLocation(prog, 'u_z'), new Float32Array(z))
+  g.uniform1i(g.getUniformLocation(prog, 'u_w'), 0)
+  g.uniform1f(g.getUniformLocation(prog, 'u_grain'), grainEnabled.value ? grainLevel.value : 0.0)
+  if (colorMode.value === 'palette') {
+    g.uniform1i(g.getUniformLocation(prog, 'u_nstops'), stops.value.length)
+    g.uniform3fv(g.getUniformLocation(prog, 'u_stops'), stopsFlat())
+  }
 }
 
-// --- Generate (static) ---
+function draw(z: number[]) {
+  if (!gl || !program) return
+  const el = canvas.value!
+  gl.viewport(0, 0, el.width, el.height)
+  setUniforms(gl, program, el.width, el.height, z)
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+}
+
+// --- Generate ---
 function generate() {
   stopMorphing()
   morphingEnabled.value = false
@@ -236,7 +268,6 @@ function generate() {
 }
 
 // --- Morphing ---
-// After setup, each frame only updates the z uniform (8 floats) → runs at 60fps on GPU
 function startMorphing() {
   animating = true
   const weights = makeWeights(makeRng())
@@ -255,19 +286,19 @@ function startMorphing() {
 
 function stopMorphing() { animating = false }
 
+// --- Download (offscreen 4K render) ---
 function download() {
   const [w, h] = EXPORT[aspectRatio.value]
   const offscreen = document.createElement('canvas')
   offscreen.width = w; offscreen.height = h
   const g = offscreen.getContext('webgl2', { preserveDrawingBuffer: true })!
 
-  const vsSrc = `#version 300 es\nin vec2 p;\nvoid main(){gl_Position=vec4(p,0,1);}`
   function comp(type: number, src: string) {
     const s = g.createShader(type)!
     g.shaderSource(s, src); g.compileShader(s); return s
   }
   const prog = g.createProgram()!
-  g.attachShader(prog, comp(g.VERTEX_SHADER, vsSrc))
+  g.attachShader(prog, comp(g.VERTEX_SHADER, `#version 300 es\nin vec2 p;\nvoid main(){gl_Position=vec4(p,0,1);}`))
   g.attachShader(prog, comp(g.FRAGMENT_SHADER, makeFragSrc(currentWeights)))
   g.linkProgram(prog); g.useProgram(prog)
   g.bindBuffer(g.ARRAY_BUFFER, g.createBuffer())
@@ -278,18 +309,16 @@ function download() {
   const data = packWeights(currentWeights)
   const ts = Math.ceil(Math.sqrt(data.length))
   const padded = new Float32Array(ts * ts); padded.set(data)
-  const tex = g.createTexture()
-  g.bindTexture(g.TEXTURE_2D, tex)
+  g.bindTexture(g.TEXTURE_2D, g.createTexture())
   g.texImage2D(g.TEXTURE_2D, 0, g.R32F, ts, ts, 0, g.RED, g.FLOAT, padded)
   g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST)
   g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST)
 
   g.viewport(0, 0, w, h)
-  g.uniform2f(g.getUniformLocation(prog, 'u_res'), w, h)
-  g.uniform1i(g.getUniformLocation(prog, 'u_ts'), ts)
-  g.uniform1fv(g.getUniformLocation(prog, 'u_z'), new Float32Array(currentZ))
-  g.uniform1i(g.getUniformLocation(prog, 'u_w'), 0)
-  g.uniform1f(g.getUniformLocation(prog, 'u_grain'), grainEnabled.value ? grainLevel.value : 0.0)
+  // override texSize temporarily for offscreen context
+  const savedTs = texSize; texSize = ts
+  setUniforms(g, prog, w, h, currentZ)
+  texSize = savedTs
   g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
 
   offscreen.toBlob(blob => {
@@ -300,6 +329,7 @@ function download() {
   })
 }
 
+// --- Restore previous ---
 function restorePrev() {
   if (!hasPrev.value) return
   currentWeights = prevWeights; currentZ = prevZ; hasPrev.value = false
@@ -308,9 +338,19 @@ function restorePrev() {
   draw(currentZ)
 }
 
+// --- Add / remove stops ---
+function addStop() {
+  if (stops.value.length < MAX_STOPS) stops.value.push('#ffffff')
+}
+function removeStop(i: number) {
+  if (stops.value.length > 2) stops.value.splice(i, 1)
+}
+
+watch(colorMode, generate)
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 watch([grainEnabled, grainLevel], () => { if (!animating) draw(currentZ) })
 watch(aspectRatio, () => { if (!animating) draw(currentZ) })
+watch(stops, () => { if (!animating) draw(currentZ) }, { deep: true })
 onMounted(() => { initGL(); generate() })
 onUnmounted(stopMorphing)
 </script>
@@ -326,9 +366,7 @@ onUnmounted(stopMorphing)
           <option value="tanh">tanh</option>
           <option value="sin">sin</option>
           <option value="cos">cos</option>
-          <option value="abs">abs</option>
-          <option value="gaussian">gaussian</option>
-          <option value="sinc">sinc</option>
+
           <option value="softplus">softplus</option>
         </select>
       </label>
@@ -343,8 +381,18 @@ onUnmounted(stopMorphing)
         <select v-model="colorMode">
           <option value="rgb">RGB</option>
           <option value="bw">B&amp;W</option>
+          <option value="palette">Palette</option>
         </select>
       </label>
+
+      <div v-if="colorMode === 'palette'" class="stop-row">
+        <span>Colors</span>
+        <div v-for="(_, i) in stops" :key="i" class="stop">
+          <input type="color" v-model="stops[i]" />
+          <button class="remove" @click="removeStop(i)" :disabled="stops.length <= 2">×</button>
+        </div>
+        <button @click="addStop" :disabled="stops.length >= MAX_STOPS">+</button>
+      </div>
 
       <label>
         <input type="checkbox" v-model="seedEnabled" />
@@ -400,4 +448,29 @@ canvas { border: 1px solid #ccc; }
 label { display: flex; align-items: center; gap: 6px; font-size: 14px; }
 select, button, input[type='number'] { padding: 5px 10px; font-size: 14px; cursor: pointer; }
 button:disabled { opacity: 0.4; cursor: default; }
+
+.stop-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+}
+.stop {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.stop input[type='color'] {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.remove {
+  padding: 2px 5px;
+  font-size: 12px;
+  line-height: 1;
+}
 </style>
