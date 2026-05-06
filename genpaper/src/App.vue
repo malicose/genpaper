@@ -29,6 +29,7 @@ const canvas = ref<HTMLCanvasElement | null>(null)
 const generating = ref(false)
 const hasGenerated = ref(false)
 const bgUrl = ref('')
+const showSettings = ref(false)
 const accentColor = ref('#8b5cf6')
 const accentColor2 = ref('#ec4899')
 
@@ -438,7 +439,17 @@ watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 watch([grainEnabled, grainLevel], () => { if (!animating) draw(currentZ) })
 watch(aspectRatio, generate, { flush: 'post' })
 watch(stops, () => { if (!animating) draw(currentZ) }, { deep: true })
-onMounted(() => { initGL(); generate() })
+
+const isMobile = ref(false)
+let mq: MediaQueryList
+
+onMounted(() => {
+  mq = window.matchMedia('(max-width: 767px)')
+  isMobile.value = mq.matches
+  mq.addEventListener('change', (e) => { isMobile.value = e.matches })
+  initGL()
+  generate()
+})
 onUnmounted(stopMorphing)
 </script>
 
@@ -454,7 +465,15 @@ onUnmounted(stopMorphing)
       <canvas ref="canvas" :width="canvasW" :height="canvasH" class="canvas" />
     </main>
 
-    <aside class="sidebar">
+    <Transition name="backdrop">
+      <div v-if="showSettings" class="mobile-backdrop" @click="showSettings = false" />
+    </Transition>
+
+    <Transition name="sheet">
+      <aside v-if="!isMobile || showSettings" class="sidebar">
+      <div class="sheet-handle" @click="showSettings = false">
+        <div class="handle-bar" />
+      </div>
       <div class="sidebar-header">
         <span class="logo" :style="{ backgroundImage: `linear-gradient(135deg, ${accentColor} 0%, ${accentColor2} 100%)` }">GenPaper</span>
       </div>
@@ -558,7 +577,23 @@ onUnmounted(stopMorphing)
           {{ generating ? 'Generating…' : 'Generate' }}
         </button>
       </div>
+      <button class="btn-close-sheet" @click="showSettings = false">Close</button>
     </aside>
+    </Transition>
+
+    <div class="mobile-bar">
+      <button class="mbar-btn" @click="restorePrev" :disabled="!hasPrev || morphingEnabled">↩</button>
+      <button class="mbar-generate" @click="generate" :disabled="generating || morphingEnabled">
+        <span v-if="generating" class="spinner"></span>
+        {{ generating ? '…' : 'Generate' }}
+      </button>
+      <button class="mbar-btn" @click="download" :disabled="!hasGenerated">↓</button>
+      <button class="mbar-btn mbar-settings" @click="showSettings = !showSettings" :class="{ active: showSettings }">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
   </div>
 </template>
 
@@ -583,7 +618,7 @@ onUnmounted(stopMorphing)
   min-height: 100vh;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
   font-size: 14px;
 }
 
@@ -1008,38 +1043,159 @@ onUnmounted(stopMorphing)
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s, transform 0.15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; transform: translateY(-4px); }
 
+/* ── Mobile bar (hidden on desktop) ── */
+.mobile-bar { display: none; }
+
+.mobile-backdrop { display: none; }
+
+.sheet-handle { display: none; }
+
+.btn-close-sheet { display: none; }
+
 /* ── Mobile ── */
 @media (max-width: 767px) {
-  .app { flex-direction: column; }
+  .app {
+    flex-direction: column;
+    padding-bottom: 72px;
+  }
 
   .canvas-wrap {
     padding: 16px 16px 12px;
     flex: none;
   }
 
-  .canvas { max-height: 55vw; }
+  .canvas { max-height: 60vw; }
 
+  /* Sidebar becomes a bottom sheet */
   .sidebar {
+    position: fixed;
+    inset: 0;
     width: 100%;
-    height: auto;
-    position: static;
+    height: 100vh;
     border-left: none;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    border-top: none;
+    border-radius: 0;
+    z-index: 100;
+    overflow: hidden;
   }
 
-  .sidebar-header { padding: 14px 16px 12px; }
+  .sheet-enter-active,
+  .sheet-leave-active {
+    transition: transform 0.4s cubic-bezier(0.32, 0.72, 0, 1);
+  }
 
-  .sidebar-body { overflow-y: visible; }
+  .sheet-enter-from,
+  .sheet-leave-to {
+    transform: translateY(100%);
+  }
+
+  .sheet-handle { display: none; }
+
+  .sidebar-header { padding: 10px 16px 12px; }
+
+  .sidebar-body {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    flex: 1;
+  }
 
   .group { padding: 14px 16px; }
 
-  .actions { padding: 14px 16px; }
+  .actions { display: none; }
+
+  .btn-close-sheet {
+    display: block;
+    width: calc(100% - 32px);
+    margin: 0 16px 64px;
+    padding: 14px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    font-size: 15px;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
 
   .color-swatch { width: 48px; height: 48px; }
 
   .stop-add { width: 48px; height: 48px; font-size: 22px; }
 
   .stop-remove { width: 22px; height: 22px; font-size: 13px; top: -7px; right: -7px; }
+
+  /* Backdrop */
+  .mobile-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 99;
+  }
+
+  .backdrop-enter-active, .backdrop-leave-active { transition: opacity 0.25s; }
+  .backdrop-enter-from, .backdrop-leave-to { opacity: 0; }
+
+  /* Mobile action bar */
+  .mobile-bar {
+    display: flex;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 64px;
+    background: rgba(17, 17, 24, 0.85);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    padding: 10px 12px;
+    gap: 8px;
+    align-items: center;
+    z-index: 98;
+  }
+
+  .mbar-btn {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: var(--radius-sm);
+    font-size: 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+
+  .mbar-btn:disabled { opacity: 0.3; cursor: default; }
+  .mbar-btn:not(:disabled):active { opacity: 0.7; }
+
+  .mbar-settings.active { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+  .mbar-generate {
+    flex: 1;
+    height: 44px;
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    border-radius: var(--radius-sm);
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    transition: background 0.15s;
+    font-family: inherit;
+  }
+
+  .mbar-generate:disabled { opacity: 0.45; cursor: default; }
+  .mbar-generate:not(:disabled):active { opacity: 0.8; }
 }
 
 @media (max-width: 400px) {
