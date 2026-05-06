@@ -5,7 +5,7 @@ interface Layer { w: number[][]; b: number[] }
 type Rng = () => number
 
 // --- Settings ---
-const activation = ref<'tanh' | 'sin' | 'cos' | 'softplus'>('tanh')
+const activation = ref<'tanh' | 'sin' | 'cos' | 'softplus' | 'sinc' | 'gaussian' | 'swish' | 'sech' | 'arctan' | 'fract'>('tanh')
 const layerCount = ref(3)
 const colorMode = ref<'rgb' | 'bw' | 'palette'>('rgb')
 const stops = ref(['#0d0221', '#9b1d6b', '#f5a623'])
@@ -154,7 +154,7 @@ function makeZ(rng: Rng): number[] {
 function lerpZ(a: number[], b: number[], t: number): number[] {
   return a.map((v, i) => v + (b[i]! - v) * t)
 }
-function smoothstep(t: number) { return t * t * (3 - 2 * t) }
+function smoothstep(t: number) { return t * t * t * (t * (t * 6 - 15) + 10) }
 
 // --- Pack weights ---
 function packWeights(layers: Layer[]): Float32Array {
@@ -195,8 +195,13 @@ function makeFragSrc(layers: Layer[]): string {
     tanh:     'return tanh(x);',
     sin:      'return sin(x);',
     cos:      'return cos(x);',
-
     softplus: 'return x>20.?x:log(1.+exp(x));',
+    sinc:     'return x==0.?1.:sin(x)/x;',
+    gaussian: 'return exp(-x*x);',
+    swish:    'return x/(1.+exp(-x));',
+    sech:     'return 2./(exp(x)+exp(-x));',
+    arctan:   'return atan(x);',
+    fract:    'return fract(x);',
   }[activation.value]
 
   let fwd = `float inp[${sizes[0]}];
@@ -363,7 +368,7 @@ function startMorphing() {
   let zA = makeZ(Math.random), zB = makeZ(Math.random), t = 0
   function step() {
     if (!animating) return
-    t += 0.015
+    t += 0.004
     if (t >= 1) { t = 0; zA = zB; zB = makeZ(Math.random) }
     draw(lerpZ(zA, zB, smoothstep(t)))
     requestAnimationFrame(step)
@@ -440,7 +445,7 @@ watch([grainEnabled, grainLevel], () => { if (!animating) draw(currentZ) })
 watch(aspectRatio, generate, { flush: 'post' })
 watch(stops, () => { if (!animating) draw(currentZ) }, { deep: true })
 
-const isMobile = ref(false)
+const isMobile = ref(typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false)
 let mq: MediaQueryList
 
 onMounted(() => {
@@ -488,6 +493,12 @@ onUnmounted(stopMorphing)
               <option value="sin">sin</option>
               <option value="cos">cos</option>
               <option value="softplus">softplus</option>
+              <option value="sinc">sinc</option>
+              <option value="gaussian">gaussian</option>
+              <option value="swish">swish</option>
+              <option value="sech">sech</option>
+              <option value="arctan">arctan</option>
+              <option value="fract">fract</option>
             </select>
           </div>
           <div class="field">
