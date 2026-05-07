@@ -49,7 +49,7 @@ const EXPORT  = { '1:1': [3840, 3840], '16:9': [3840, 2160], '9:16': [2160, 3840
 const canvasW = computed(() => DISPLAY[aspectRatio.value][0])
 const canvasH = computed(() => DISPLAY[aspectRatio.value][1])
 
-const MAX_STOPS = 6
+const MAX_STOPS = 12
 
 // --- Runtime state ---
 const canvas = ref<HTMLCanvasElement | null>(null)
@@ -922,6 +922,84 @@ function removeStop(i: number) {
   if (stops.value.length > 2) stops.value.splice(i, 1)
 }
 
+// --- Extract palette from uploaded image ---
+const imageInput = ref<HTMLInputElement | null>(null)
+
+type RGB = [number, number, number]
+
+function kMeans(pixels: RGB[], k: number): RGB[] {
+  const step = Math.floor(pixels.length / k)
+  let centers: RGB[] = Array.from({ length: k }, (_, i) => {
+    const p = pixels[Math.min(i * step, pixels.length - 1)] ?? [0, 0, 0]
+    return [p[0], p[1], p[2]]
+  })
+  for (let iter = 0; iter < 25; iter++) {
+    const sums: RGB[] = Array.from({ length: k }, (): RGB => [0, 0, 0])
+    const counts: number[] = new Array<number>(k).fill(0)
+    for (const p of pixels) {
+      let best = 0, bestDist = Infinity
+      for (let j = 0; j < k; j++) {
+        const c = centers[j] ?? [0, 0, 0]
+        const d = (p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2
+        if (d < bestDist) { bestDist = d; best = j }
+      }
+      const s = sums[best] ?? [0, 0, 0]
+      s[0] += p[0]; s[1] += p[1]; s[2] += p[2]
+      counts[best] = (counts[best] ?? 0) + 1
+    }
+    centers = centers.map((c, j): RGB => {
+      const n = counts[j] ?? 0
+      const s = sums[j] ?? [0, 0, 0]
+      return n > 0 ? [s[0] / n, s[1] / n, s[2] / n] : c
+    })
+  }
+  return centers
+}
+
+function onImageUpload(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  const url = URL.createObjectURL(file)
+  const img = new Image()
+  img.onload = () => {
+    const size = 120
+    const canvas = document.createElement('canvas')
+    canvas.width = size; canvas.height = size
+    const ctx = canvas.getContext('2d')!
+    ctx.drawImage(img, 0, 0, size, size)
+    URL.revokeObjectURL(url)
+    const raw = ctx.getImageData(0, 0, size, size).data
+    const pixels: RGB[] = []
+    for (let i = 0; i < raw.length; i += 4) {
+      if ((raw[i + 3] ?? 255) < 128) continue
+      pixels.push([raw[i] ?? 0, raw[i + 1] ?? 0, raw[i + 2] ?? 0])
+    }
+    const k = MAX_STOPS
+    const centers = kMeans(pixels, k)
+    stops.value = centers.map(([r, g, b]) =>
+      '#' + [r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('')
+    )
+    colorMode.value = 'palette'
+
+    // derive accent from the most saturated cluster
+    let bestSat = -1, bestR = 0, bestG = 0, bestB = 0
+    for (const [r, g, b] of centers) {
+      const rn = r / 255, gn = g / 255, bn = b / 255
+      const max = Math.max(rn, gn, bn)
+      const sat = max === 0 ? 0 : (max - Math.min(rn, gn, bn)) / max
+      if (sat > bestSat) { bestSat = sat; bestR = rn; bestG = gn; bestB = bn }
+    }
+    if (bestSat > 0.1) {
+      const [h, s] = rgbToHsl(bestR, bestG, bestB)
+      accentColor.value  = withWhiteContrast(h, Math.max(s, 0.65), 0.6)
+      accentColor2.value = withWhiteContrast((h + 38) % 360, Math.max(s, 0.65), 0.6)
+    }
+
+    ;(e.target as HTMLInputElement).value = ''
+  }
+  img.src = url
+}
+
 watch(colorMode, () => { morphingEnabled.value ? (stopMorphing(), startMorphing()) : generate() })
 
 watch([activation, activation2, dualActivation], async () => {
@@ -1116,12 +1194,16 @@ onUnmounted(() => {
             <button :class="['seg-btn', colorMode === 'bw' && 'active']" @click="colorMode = 'bw'">B&amp;W</button>
             <button :class="['seg-btn', colorMode === 'palette' && 'active']" @click="colorMode = 'palette'">Palette</button>
           </div>
-          <div v-if="colorMode === 'palette'" class="stop-row">
-            <div v-for="(_, i) in stops" :key="i" class="stop">
-              <input type="color" v-model="stops[i]" class="color-swatch" />
-              <button class="stop-remove" @click="removeStop(i)" :disabled="stops.length <= 2">×</button>
+          <div v-if="colorMode === 'palette'" class="palette-wrap">
+            <button class="upload-img-btn" @click="imageInput?.click()">Upload image</button>
+            <input ref="imageInput" type="file" accept="image/*" style="display:none" @change="onImageUpload" />
+            <div class="stop-row">
+              <div v-for="(_, i) in stops" :key="i" class="stop">
+                <input type="color" v-model="stops[i]" class="color-swatch" />
+                <button class="stop-remove" @click="removeStop(i)" :disabled="stops.length <= 2">×</button>
+              </div>
+              <button class="stop-add" @click="addStop" :disabled="stops.length >= MAX_STOPS">+</button>
             </div>
-            <button class="stop-add" @click="addStop" :disabled="stops.length >= MAX_STOPS">+</button>
           </div>
         </section>
 
@@ -1500,7 +1582,6 @@ onUnmounted(() => {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
-  margin-top: 10px;
 }
 
 .stop { position: relative; }
@@ -1554,6 +1635,27 @@ onUnmounted(() => {
   padding: 0;
   transition: all 0.15s;
 }
+
+.palette-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.upload-img-btn {
+  width: 100%;
+  height: 38px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.upload-img-btn:hover { border-color: var(--accent); color: var(--accent); }
 
 .stop-add:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .stop-add:disabled { opacity: 0.25; cursor: default; }
