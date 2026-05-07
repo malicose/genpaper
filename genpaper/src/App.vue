@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 
 interface Layer { w: number[][]; b: number[] }
 type Rng = () => number
@@ -135,6 +135,9 @@ let currentWeights: Layer[] = []
 let prevWeights: Layer[] = []
 let prevZ: number[] = []
 const hasPrev = ref(false)
+
+const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
+let cpuWorker: Worker | null = null
 
 // --- PRNG ---
 function mulberry32(s: number): Rng {
@@ -344,24 +347,62 @@ function captureBg() {
   extractAccent()
 }
 
+// --- CPU Worker render ---
+function renderWithWorker(layers: Layer[], z: number[]): Promise<void> {
+  return new Promise(resolve => {
+    if (!cpuWorker || !canvas.value) { resolve(); return }
+    const w = canvas.value.width
+    const h = canvas.value.height
+    const stopsRgb = stops.value.map(hex => {
+      const n = parseInt(hex.slice(1), 16)
+      return [(n >> 16) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255] as [number, number, number]
+    })
+
+    cpuWorker.onmessage = (e: MessageEvent<{ buffer: ArrayBuffer }>) => {
+      const ctx = canvas.value!.getContext('2d')!
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(e.data.buffer), w, h), 0, 0)
+      captureBg()
+      resolve()
+    }
+
+    cpuWorker.postMessage({
+      width: w, height: h,
+      layers, z,
+      activation: activation.value,
+      activation2: activation2.value,
+      dualActivation: dualActivation.value,
+      colorMode: colorMode.value,
+      stops: stopsRgb,
+      grainSeed: Math.random() * 99999,
+      grainLevel: grainEnabled.value ? grainLevel.value : 0,
+    } satisfies import('./render.worker').RenderMsg)
+  })
+}
+
 // --- Generate ---
-function generate() {
+async function generate() {
   stopMorphing()
   morphingEnabled.value = false
   generating.value = true
-  setTimeout(() => {
-    const rng = makeRng()
-    if (currentWeights.length) { prevWeights = currentWeights; prevZ = currentZ; hasPrev.value = true }
-    const weights = makeWeights(rng)
-    uploadWeights(weights)
+  await nextTick()
+
+  const rng = makeRng()
+  if (currentWeights.length) { prevWeights = currentWeights; prevZ = currentZ; hasPrev.value = true }
+  const weights = makeWeights(rng)
+  currentZ = makeZ(rng)
+  currentWeights = weights
+
+  if (isWindows) {
+    await renderWithWorker(currentWeights, currentZ)
+  } else {
     buildProgram(weights)
-    currentZ = makeZ(rng)
-    currentWeights = weights
+    uploadWeights(weights)
     draw(currentZ)
     captureBg()
-    generating.value = false
-    hasGenerated.value = true
-  }, 10)
+  }
+
+  generating.value = false
+  hasGenerated.value = true
 }
 
 // --- Morphing ---
@@ -385,6 +426,40 @@ function stopMorphing() { animating = false }
 
 // --- Download (offscreen 4K render) ---
 function download() {
+  if (isWindows) {
+    const [w, h] = EXPORT[aspectRatio.value]
+    const offscreen = document.createElement('canvas')
+    offscreen.width = w; offscreen.height = h
+    const ctx = offscreen.getContext('2d')!
+    const dlWorker = new Worker(new URL('./render.worker.ts', import.meta.url), { type: 'module' })
+    const stopsRgb = stops.value.map(hex => {
+      const n = parseInt(hex.slice(1), 16)
+      return [(n >> 16) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255] as [number, number, number]
+    })
+    dlWorker.onmessage = (e: MessageEvent<{ buffer: ArrayBuffer }>) => {
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(e.data.buffer), w, h), 0, 0)
+      dlWorker.terminate()
+      offscreen.toBlob(blob => {
+        const url = URL.createObjectURL(blob!)
+        const a = document.createElement('a')
+        a.href = url; a.download = `wallpaper-${aspectRatio.value.replace(':', 'x')}.png`
+        a.click(); URL.revokeObjectURL(url)
+      })
+    }
+    dlWorker.postMessage({
+      width: w, height: h,
+      layers: currentWeights, z: currentZ,
+      activation: activation.value,
+      activation2: activation2.value,
+      dualActivation: dualActivation.value,
+      colorMode: colorMode.value,
+      stops: stopsRgb,
+      grainSeed: Math.random() * 99999,
+      grainLevel: grainEnabled.value ? grainLevel.value : 0,
+    })
+    return
+  }
+
   const [w, h] = EXPORT[aspectRatio.value]
   const offscreen = document.createElement('canvas')
   offscreen.width = w; offscreen.height = h
@@ -427,13 +502,21 @@ function download() {
 }
 
 // --- Restore previous ---
-function restorePrev() {
+async function restorePrev() {
   if (!hasPrev.value) return
   currentWeights = prevWeights; currentZ = prevZ; hasPrev.value = false
-  uploadWeights(currentWeights)
-  buildProgram(currentWeights)
-  draw(currentZ)
-  captureBg()
+  generating.value = true
+
+  if (isWindows) {
+    await renderWithWorker(currentWeights, currentZ)
+  } else {
+    buildProgram(currentWeights)
+    uploadWeights(currentWeights)
+    draw(currentZ)
+    captureBg()
+  }
+
+  generating.value = false
 }
 
 // --- Add / remove stops ---
@@ -445,14 +528,44 @@ function removeStop(i: number) {
 }
 
 watch(colorMode, () => { morphingEnabled.value ? (stopMorphing(), startMorphing()) : generate() })
-watch([activation, activation2, layerCount, dualActivation], () => {
+
+watch([activation, activation2, layerCount, dualActivation], async () => {
   if (morphingEnabled.value) { stopMorphing(); startMorphing() }
-  else if (hasGenerated.value) { buildProgram(currentWeights); draw(currentZ); captureBg() }
+  else if (hasGenerated.value) {
+    generating.value = true
+    if (isWindows) {
+      await renderWithWorker(currentWeights, currentZ)
+    } else {
+      buildProgram(currentWeights)
+      uploadWeights(currentWeights)
+      draw(currentZ)
+      captureBg()
+    }
+    generating.value = false
+  }
 })
+
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
-watch([grainEnabled, grainLevel], () => { if (!animating) draw(currentZ) })
+
+watch([grainEnabled, grainLevel], async () => {
+  if (animating) return
+  if (isWindows) {
+    await renderWithWorker(currentWeights, currentZ)
+  } else {
+    draw(currentZ)
+  }
+})
+
 watch(aspectRatio, generate, { flush: 'post' })
-watch(stops, () => { if (!animating) draw(currentZ) }, { deep: true })
+
+watch(stops, async () => {
+  if (animating || !hasGenerated.value) return
+  if (isWindows) {
+    await renderWithWorker(currentWeights, currentZ)
+  } else {
+    draw(currentZ)
+  }
+}, { deep: true })
 
 const isMobile = ref(typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false)
 let mq: MediaQueryList
@@ -461,10 +574,19 @@ onMounted(() => {
   mq = window.matchMedia('(max-width: 767px)')
   isMobile.value = mq.matches
   mq.addEventListener('change', (e) => { isMobile.value = e.matches })
-  initGL()
+
+  if (isWindows) {
+    cpuWorker = new Worker(new URL('./render.worker.ts', import.meta.url), { type: 'module' })
+  } else {
+    initGL()
+  }
   generate()
 })
-onUnmounted(stopMorphing)
+
+onUnmounted(() => {
+  stopMorphing()
+  cpuWorker?.terminate()
+})
 </script>
 
 <template>
@@ -565,7 +687,7 @@ onUnmounted(stopMorphing)
               <input type="range" v-model.number="grainLevel" min="0.02" max="0.5" step="0.01" class="slider" />
             </div>
           </Transition>
-          <div class="field row">
+          <div v-if="!isWindows" class="field row">
             <div class="field-label">Morph</div>
             <div class="toggle-wrap">
               <input type="checkbox" v-model="morphingEnabled" id="morph-toggle" class="toggle-input" />
