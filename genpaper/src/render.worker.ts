@@ -108,5 +108,5 @@ self.onmessage = (e: MessageEvent<RenderMsg>) => {
     }
   }
 
-  self.postMessage({ buffer: buf.buffer }, [buf.buffer])
+  self.postMessage({ buffer: buf.buffer }, { transfer: [buf.buffer] })
 }
