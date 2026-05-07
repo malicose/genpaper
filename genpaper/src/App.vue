@@ -156,6 +156,7 @@ let currentWeights: Layer[] = []
 let prevWeights: Layer[] = []
 let prevZ: number[] = []
 const hasPrev = ref(false)
+let glassBlobs: Float32Array = new Float32Array(18)
 
 const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 let cpuWorker: Worker | null = null
@@ -317,6 +318,21 @@ void main(){
 }
 
 // --- Glass shader ---
+function makeGlassBlobs(rng: Rng): Float32Array {
+  const asp = canvasW.value / canvasH.value
+  const data = new Float32Array(18)
+  const cx = (rng() * 1.6 - 0.8) * asp
+  const cy = rng() * 1.6 - 0.8
+  for (let i = 0; i < 6; i++) {
+    const angle = rng() * Math.PI * 2
+    const dist  = rng() * 0.45
+    data[i*3]   = cx + Math.cos(angle) * dist * asp
+    data[i*3+1] = cy + Math.sin(angle) * dist
+    data[i*3+2] = 0.25 + rng() * 0.25
+  }
+  return data
+}
+
 // 11-tap horizontal Gaussian (sigma = 2*step), step in pixels
 function makeBlurSrc(): string {
   return `#version 300 es
@@ -345,34 +361,38 @@ uniform sampler2D u_scene;
 uniform sampler2D u_hblurred;
 uniform vec2 u_res;
 uniform float u_frost;
-uniform vec4 u_glass;
-uniform float u_corner;
+uniform vec3 u_blobs[6];
 
-float sdRBox(vec2 p,vec2 b,float r){
-  vec2 q=abs(p)-b+r;
-  return length(max(q,0.))+min(max(q.x,q.y),0.)-r;
+float smin(float a,float b,float k){
+  float h=clamp(0.5+0.5*(b-a)/k,0.,1.);
+  return mix(b,a,h)-k*h*(1.-h);
+}
+float blobField(vec2 p){
+  float d=1e9;
+  for(int i=0;i<6;i++){
+    float di=length(p-u_blobs[i].xy)-u_blobs[i].z;
+    d=smin(d,di,0.25);
+  }
+  return d;
 }
 
 void main(){
   vec2 uv=gl_FragCoord.xy/u_res;
   uv.y=1.-uv.y;
   float asp=u_res.x/u_res.y;
-  vec2 p=(uv-u_glass.xy)*vec2(asp,1.);
-  vec2 b=u_glass.zw*vec2(asp,1.);
-  float cr=u_corner*asp;
-  float d=sdRBox(p,b,cr);
-  if(d>0.008){fragColor=texture(u_scene,uv);return;}
-  float inside=smoothstep(0.004,-0.001,d);
-  float eps=0.003;
-  float nx=sdRBox(p+vec2(eps,0.),b,cr)-sdRBox(p-vec2(eps,0.),b,cr);
-  float ny=sdRBox(p+vec2(0.,eps),b,cr)-sdRBox(p-vec2(0.,eps),b,cr);
+  vec2 p=(uv-0.5)*2.*vec2(asp,1.);
+  float d=blobField(p);
+  if(d>0.04){fragColor=texture(u_scene,uv);return;}
+  float inside=smoothstep(0.003,-0.001,d);
+  float eps=0.005;
+  float nx=blobField(p+vec2(eps,0.))-blobField(p-vec2(eps,0.));
+  float ny=blobField(p+vec2(0.,eps))-blobField(p-vec2(0.,eps));
   vec2 nrm=normalize(vec2(nx,ny)+vec2(1e-6));
   vec2 nrmDir=normalize(nrm*vec2(1./asp,1.));
-  // Pure blurred interior — no sharp scene sampling, no artifacts
   vec3 glass=texture(u_hblurred,uv).rgb;
   glass*=vec3(1.01,1.02,1.06);
   glass+=0.025*(1.-u_frost*0.6);
-  float rimBand=smoothstep(0.007,0.001,d)-smoothstep(0.001,-0.004,d);
+  float rimBand=smoothstep(0.006,0.001,d)-smoothstep(0.001,-0.004,d);
   float rimDir=max(0.,dot(-nrmDir,normalize(vec2(1.,1.))));
   glass+=rimBand*(0.04+rimDir*0.38);
   float shadowDir=max(0.,dot(nrmDir,normalize(vec2(1.,1.))));
@@ -429,13 +449,18 @@ function ensureFramebuffer(w: number, h: number) {
 }
 
 function setGlassUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h: number) {
-  const hw = glassSize.value * 0.5
   g.uniform2f(g.getUniformLocation(prog, 'u_res'), w, h)
   g.uniform1i(g.getUniformLocation(prog, 'u_scene'), 0)
   g.uniform1i(g.getUniformLocation(prog, 'u_hblurred'), 1)
   g.uniform1f(g.getUniformLocation(prog, 'u_frost'), glassFrost.value)
-  g.uniform4f(g.getUniformLocation(prog, 'u_glass'), 0.5, 0.5, hw, hw)
-  g.uniform1f(g.getUniformLocation(prog, 'u_corner'), glassSize.value * 0.07)
+  const s = glassSize.value / 0.55
+  const scaled = new Float32Array(18)
+  for (let i = 0; i < 6; i++) {
+    scaled[i * 3]     = (glassBlobs[i * 3]     ?? 0) * s
+    scaled[i * 3 + 1] = (glassBlobs[i * 3 + 1] ?? 0) * s
+    scaled[i * 3 + 2] = (glassBlobs[i * 3 + 2] ?? 0) * s
+  }
+  g.uniform3fv(g.getUniformLocation(prog, 'u_blobs'), scaled)
 }
 
 function setBlurUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h: number, dx: number, dy: number) {
@@ -606,6 +631,7 @@ async function generate() {
   if (currentWeights.length) { prevWeights = currentWeights; prevZ = currentZ; hasPrev.value = true }
   const weights = makeNetworkWeights(rng)
   currentZ = makeZ(rng)
+  glassBlobs = makeGlassBlobs(rng)
   currentWeights = weights
 
   if (isWindows) {
@@ -825,7 +851,8 @@ watch([activation, activation2, dualActivation], async () => {
   }
 })
 
-watch(layerCount, () => {
+watch(layerCount, (n) => {
+  if (n > 3) glassEnabled.value = false
   if (morphingEnabled.value) { stopMorphing(); startMorphing() }
   else if (hasGenerated.value) generate()
 })
@@ -842,7 +869,10 @@ watch(sirenOmega, () => {
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 
 watch([glassEnabled, glassFrost, glassRefraction, glassSize], async () => {
-  if (glassEnabled.value && !glassProgram) buildGlassProgram()
+  if (glassEnabled.value) {
+    if (!glassProgram) buildGlassProgram()
+    if (glassBlobs[2] === 0) glassBlobs = makeGlassBlobs(Math.random)
+  }
   if (animating || !hasGenerated.value) return
   if (isWindows) {
     await renderWithWorker(currentWeights, currentZ)
@@ -1024,7 +1054,7 @@ onUnmounted(() => {
               <label for="morph-toggle" class="toggle"></label>
             </div>
           </div>
-          <div v-if="!isWindows" class="field row">
+          <div v-if="!isWindows && layerCount <= 3" class="field row">
             <div class="field-label">Glass</div>
             <div class="toggle-wrap">
               <input type="checkbox" v-model="glassEnabled" id="glass-toggle" class="toggle-input" />
@@ -1032,7 +1062,7 @@ onUnmounted(() => {
             </div>
           </div>
           <Transition name="fade">
-            <div v-if="glassEnabled && !isWindows">
+            <div v-if="glassEnabled && !isWindows && layerCount <= 3">
               <div class="field">
                 <div class="field-label">Frost <span class="field-value">{{ glassFrost.toFixed(2) }}</span></div>
                 <input type="range" v-model.number="glassFrost" min="0" max="1" step="0.01" class="slider" />
