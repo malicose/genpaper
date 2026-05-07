@@ -40,6 +40,8 @@ const glassEnabled = ref(false)
 const glassFrost = ref(0.45)
 const glassRefraction = ref(0.8)
 const glassSize = ref(0.55)
+const glassBlobCount = ref(6)
+const glassBlobSmooth = ref(0.25)
 const aspectRatio = ref<'1:1' | '16:9' | '9:16'>('1:1')
 
 const DISPLAY = { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] } as const
@@ -156,7 +158,7 @@ let currentWeights: Layer[] = []
 let prevWeights: Layer[] = []
 let prevZ: number[] = []
 const hasPrev = ref(false)
-let glassBlobs: Float32Array = new Float32Array(18)
+let glassBlobs: Float32Array = new Float32Array(36)
 
 const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 let cpuWorker: Worker | null = null
@@ -318,12 +320,15 @@ void main(){
 }
 
 // --- Glass shader ---
+const MAX_BLOBS = 12
+
 function makeGlassBlobs(rng: Rng): Float32Array {
   const asp = canvasW.value / canvasH.value
-  const data = new Float32Array(18)
+  const n = glassBlobCount.value
+  const data = new Float32Array(MAX_BLOBS * 3)
   const cx = (rng() * 1.6 - 0.8) * asp
   const cy = rng() * 1.6 - 0.8
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < n; i++) {
     const angle = rng() * Math.PI * 2
     const dist  = rng() * 0.45
     data[i*3]   = cx + Math.cos(angle) * dist * asp
@@ -361,7 +366,11 @@ uniform sampler2D u_scene;
 uniform sampler2D u_hblurred;
 uniform vec2 u_res;
 uniform float u_frost;
-uniform vec3 u_blobs[6];
+uniform float u_grain;
+uniform float u_smooth;
+uniform int u_nblobs;
+uniform vec3 u_blobs[12];
+float noise(vec2 p){return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453);}
 
 float smin(float a,float b,float k){
   float h=clamp(0.5+0.5*(b-a)/k,0.,1.);
@@ -369,9 +378,10 @@ float smin(float a,float b,float k){
 }
 float blobField(vec2 p){
   float d=1e9;
-  for(int i=0;i<6;i++){
+  for(int i=0;i<12;i++){
+    if(i>=u_nblobs)break;
     float di=length(p-u_blobs[i].xy)-u_blobs[i].z;
-    d=smin(d,di,0.25);
+    d=smin(d,di,u_smooth);
   }
   return d;
 }
@@ -382,7 +392,10 @@ void main(){
   float asp=u_res.x/u_res.y;
   vec2 p=(uv-0.5)*2.*vec2(asp,1.);
   float d=blobField(p);
-  if(d>0.04){fragColor=texture(u_scene,uv);return;}
+  if(d>0.04){
+    vec3 sc=texture(u_scene,uv).rgb+(noise(gl_FragCoord.xy)-0.5)*u_grain;
+    fragColor=vec4(clamp(sc,0.,1.),1.);return;
+  }
   float inside=smoothstep(0.003,-0.001,d);
   float eps=0.005;
   float nx=blobField(p+vec2(eps,0.))-blobField(p-vec2(eps,0.));
@@ -397,7 +410,9 @@ void main(){
   glass+=rimBand*(0.04+rimDir*0.38);
   float shadowDir=max(0.,dot(nrmDir,normalize(vec2(1.,1.))));
   glass-=rimBand*shadowDir*0.1;
-  fragColor=vec4(clamp(mix(texture(u_scene,uv).rgb,glass,inside),0.,1.),1.);
+  vec3 col=mix(texture(u_scene,uv).rgb,glass,inside);
+  col+=(noise(gl_FragCoord.xy)-0.5)*u_grain;
+  fragColor=vec4(clamp(col,0.,1.),1.);
 }`
 }
 
@@ -453,9 +468,12 @@ function setGlassUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: numb
   g.uniform1i(g.getUniformLocation(prog, 'u_scene'), 0)
   g.uniform1i(g.getUniformLocation(prog, 'u_hblurred'), 1)
   g.uniform1f(g.getUniformLocation(prog, 'u_frost'), glassFrost.value)
+  g.uniform1f(g.getUniformLocation(prog, 'u_grain'), grainEnabled.value ? grainLevel.value : 0.0)
+  g.uniform1f(g.getUniformLocation(prog, 'u_smooth'), glassBlobSmooth.value)
+  g.uniform1i(g.getUniformLocation(prog, 'u_nblobs'), glassBlobCount.value)
   const s = glassSize.value / 0.55
-  const scaled = new Float32Array(18)
-  for (let i = 0; i < 6; i++) {
+  const scaled = new Float32Array(MAX_BLOBS * 3)
+  for (let i = 0; i < MAX_BLOBS; i++) {
     scaled[i * 3]     = (glassBlobs[i * 3]     ?? 0) * s
     scaled[i * 3 + 1] = (glassBlobs[i * 3 + 1] ?? 0) * s
     scaled[i * 3 + 2] = (glassBlobs[i * 3 + 2] ?? 0) * s
@@ -523,7 +541,7 @@ function setUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h
   g.uniform1i(g.getUniformLocation(prog, 'u_ts'), texSize)
   g.uniform1fv(g.getUniformLocation(prog, 'u_z'), new Float32Array(z))
   g.uniform1i(g.getUniformLocation(prog, 'u_w'), 0)
-  g.uniform1f(g.getUniformLocation(prog, 'u_grain'), grainEnabled.value ? grainLevel.value : 0.0)
+  g.uniform1f(g.getUniformLocation(prog, 'u_grain'), (grainEnabled.value && !glassEnabled.value) ? grainLevel.value : 0.0)
   if (colorMode.value === 'palette') {
     g.uniform1i(g.getUniformLocation(prog, 'u_nstops'), stops.value.length)
     g.uniform3fv(g.getUniformLocation(prog, 'u_stops'), stopsFlat())
@@ -868,7 +886,11 @@ watch(sirenOmega, () => {
 
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 
-watch([glassEnabled, glassFrost, glassRefraction, glassSize], async () => {
+watch(glassBlobCount, () => {
+  glassBlobs = makeGlassBlobs(Math.random)
+})
+
+watch([glassEnabled, glassFrost, glassRefraction, glassSize, glassBlobCount, glassBlobSmooth], async () => {
   if (glassEnabled.value) {
     if (!glassProgram) buildGlassProgram()
     if (glassBlobs[2] === 0) glassBlobs = makeGlassBlobs(Math.random)
@@ -1068,12 +1090,16 @@ onUnmounted(() => {
                 <input type="range" v-model.number="glassFrost" min="0" max="1" step="0.01" class="slider" />
               </div>
               <div class="field">
-                <div class="field-label">Refraction <span class="field-value">{{ glassRefraction.toFixed(2) }}</span></div>
-                <input type="range" v-model.number="glassRefraction" min="0" max="1" step="0.01" class="slider" />
+                <div class="field-label">Size <span class="field-value">{{ glassSize.toFixed(2) }}</span></div>
+                <input type="range" v-model.number="glassSize" min="0.1" max="2.0" step="0.01" class="slider" />
               </div>
               <div class="field">
-                <div class="field-label">Size <span class="field-value">{{ glassSize.toFixed(2) }}</span></div>
-                <input type="range" v-model.number="glassSize" min="0.1" max="0.9" step="0.01" class="slider" />
+                <div class="field-label">Count <span class="field-value">{{ glassBlobCount }}</span></div>
+                <input type="range" v-model.number="glassBlobCount" min="1" max="12" step="1" class="slider" />
+              </div>
+              <div class="field">
+                <div class="field-label">Smooth <span class="field-value">{{ glassBlobSmooth.toFixed(2) }}</span></div>
+                <input type="range" v-model.number="glassBlobSmooth" min="0.02" max="0.6" step="0.01" class="slider" />
               </div>
             </div>
           </Transition>
