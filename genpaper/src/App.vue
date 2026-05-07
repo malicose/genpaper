@@ -54,6 +54,7 @@ const MAX_STOPS = 6
 // --- Runtime state ---
 const canvas = ref<HTMLCanvasElement | null>(null)
 const generating = ref(false)
+const downloading = ref(false)
 const hasGenerated = ref(false)
 const bgUrl = ref('')
 const showSettings = ref(false)
@@ -321,6 +322,17 @@ void main(){
 
 // --- Glass shader ---
 const MAX_BLOBS = 12
+
+function scaledBlobsArray(): number[] {
+  const s = glassSize.value / 0.55
+  const arr: number[] = []
+  for (let i = 0; i < MAX_BLOBS; i++) {
+    arr.push((glassBlobs[i * 3]     ?? 0) * s)
+    arr.push((glassBlobs[i * 3 + 1] ?? 0) * s)
+    arr.push((glassBlobs[i * 3 + 2] ?? 0) * s)
+  }
+  return arr
+}
 
 function makeGlassBlobs(rng: Rng): Float32Array {
   const asp = canvasW.value / canvasH.value
@@ -632,7 +644,14 @@ function renderWithWorker(layers: Layer[], z: number[]): Promise<void> {
       colorMode: colorMode.value,
       stops: stopsRgb,
       grainSeed: Math.random() * 99999,
-      grainLevel: grainEnabled.value ? grainLevel.value : 0,
+      grainLevel: grainEnabled.value && !glassEnabled.value ? grainLevel.value : 0,
+      glass: glassEnabled.value ? {
+        blobs: scaledBlobsArray(),
+        nblobs: glassBlobCount.value,
+        smooth: glassBlobSmooth.value,
+        frost: glassFrost.value,
+        grainLevel: grainEnabled.value ? grainLevel.value : 0,
+      } : undefined,
     } satisfies import('./render.worker').RenderMsg)
   })
 }
@@ -687,36 +706,86 @@ function stopMorphing() { animating = false }
 // --- Download (offscreen 4K render) ---
 function download() {
   if (isWindows) {
+    downloading.value = true
     const [w, h] = EXPORT[aspectRatio.value]
-    const offscreen = document.createElement('canvas')
-    offscreen.width = w; offscreen.height = h
-    const ctx = offscreen.getContext('2d')!
-    const dlWorker = new Worker(new URL('./render.worker.ts', import.meta.url), { type: 'module' })
+    const nWorkers = Math.max(1, Math.min(8, navigator.hardwareConcurrency || 4))
+    const chunkSize = Math.ceil(h / nWorkers)
     const stopsRgb = stops.value.map(hex => {
       const n = parseInt(hex.slice(1), 16)
       return [(n >> 16) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255] as [number, number, number]
     })
-    dlWorker.onmessage = (e: MessageEvent<{ buffer: ArrayBuffer }>) => {
-      ctx.putImageData(new ImageData(new Uint8ClampedArray(e.data.buffer), w, h), 0, 0)
-      dlWorker.terminate()
-      offscreen.toBlob(blob => {
-        const url = URL.createObjectURL(blob!)
-        const a = document.createElement('a')
-        a.href = url; a.download = `wallpaper-${aspectRatio.value.replace(':', 'x')}.png`
-        a.click(); URL.revokeObjectURL(url)
-      })
-    }
-    dlWorker.postMessage({
+    const grainSeed = Math.random() * 99999
+    const glassParams = glassEnabled.value ? {
+      blobs: scaledBlobsArray(), nblobs: glassBlobCount.value,
+      smooth: glassBlobSmooth.value, frost: glassFrost.value,
+      grainLevel: grainEnabled.value ? grainLevel.value : 0,
+    } : undefined
+    const baseMsg = {
       width: w, height: h,
       layers: currentWeights, z: currentZ,
       activation: networkType.value === 'siren' ? 'wave' : activation.value,
       activation2: networkType.value === 'siren' ? 'wave' : activation2.value,
       dualActivation: networkType.value === 'siren' ? false : dualActivation.value,
       colorMode: colorMode.value,
-      stops: stopsRgb,
-      grainSeed: Math.random() * 99999,
-      grainLevel: grainEnabled.value ? grainLevel.value : 0,
-    })
+      stops: stopsRgb, grainSeed,
+      grainLevel: grainEnabled.value && !glassEnabled.value ? grainLevel.value : 0,
+    } satisfies import('./render.worker').RenderMsg
+
+    // Phase 1: parallel scene render across nWorkers strips
+    const fullBuf = new Uint8ClampedArray(w * h * 4)
+    let done = 0
+    const workers: Worker[] = []
+
+    const finalize = () => {
+      workers.forEach(wk => wk.terminate())
+      if (!glassParams) {
+        // No glass — write directly to canvas and download
+        const offscreen = document.createElement('canvas')
+        offscreen.width = w; offscreen.height = h
+        offscreen.getContext('2d')!.putImageData(new ImageData(fullBuf, w, h), 0, 0)
+        offscreen.toBlob(blob => {
+          const url = URL.createObjectURL(blob!)
+          const a = document.createElement('a')
+          a.href = url; a.download = `wallpaper-${aspectRatio.value.replace(':', 'x')}-${Date.now()}.png`
+          a.click(); URL.revokeObjectURL(url)
+          downloading.value = false
+        })
+      } else {
+        // Phase 2: glass composite in a single worker (needs full scene buffer)
+        const glassWorker = new Worker(new URL('./render.worker.ts', import.meta.url), { type: 'module' })
+        const sceneBuf = fullBuf.buffer.slice(0) as ArrayBuffer
+        glassWorker.onmessage = (ev: MessageEvent<{ buffer: ArrayBuffer }>) => {
+          glassWorker.terminate()
+          const offscreen = document.createElement('canvas')
+          offscreen.width = w; offscreen.height = h
+          offscreen.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(ev.data.buffer), w, h), 0, 0)
+          offscreen.toBlob(blob => {
+            const url = URL.createObjectURL(blob!)
+            const a = document.createElement('a')
+            a.href = url; a.download = `wallpaper-${aspectRatio.value.replace(':', 'x')}-${Date.now()}.png`
+            a.click(); URL.revokeObjectURL(url)
+            downloading.value = false
+          })
+        }
+        glassWorker.postMessage(
+          { width: w, height: h, rawScene: sceneBuf, grainSeed, glass: glassParams } satisfies import('./render.worker').RenderMsg,
+          { transfer: [sceneBuf] }
+        )
+      }
+    }
+
+    for (let i = 0; i < nWorkers; i++) {
+      const yStart = i * chunkSize
+      const yEnd = Math.min(yStart + chunkSize, h)
+      const wk = new Worker(new URL('./render.worker.ts', import.meta.url), { type: 'module' })
+      workers.push(wk)
+      wk.onmessage = (ev: MessageEvent<{ buffer: ArrayBuffer, yStart: number }>) => {
+        const chunk = new Uint8ClampedArray(ev.data.buffer)
+        fullBuf.set(chunk, ev.data.yStart * w * 4)
+        if (++done === nWorkers) finalize()
+      }
+      wk.postMessage({ ...baseMsg, yStart, yEnd } satisfies import('./render.worker').RenderMsg)
+    }
     return
   }
 
@@ -817,11 +886,13 @@ function download() {
 
   texSize = savedTs
 
+  downloading.value = true
   offscreen.toBlob(blob => {
     const url = URL.createObjectURL(blob!)
     const a = document.createElement('a')
-    a.href = url; a.download = `wallpaper-${aspectRatio.value.replace(':', 'x')}.png`
+    a.href = url; a.download = `wallpaper-${aspectRatio.value.replace(':', 'x')}-${Date.now()}.png`
     a.click(); URL.revokeObjectURL(url)
+    downloading.value = false
   })
 }
 
@@ -892,7 +963,7 @@ watch(glassBlobCount, () => {
 
 watch([glassEnabled, glassFrost, glassRefraction, glassSize, glassBlobCount, glassBlobSmooth], async () => {
   if (glassEnabled.value) {
-    if (!glassProgram) buildGlassProgram()
+    if (!isWindows && !glassProgram) buildGlassProgram()
     if (glassBlobs[2] === 0) glassBlobs = makeGlassBlobs(Math.random)
   }
   if (animating || !hasGenerated.value) return
@@ -1076,7 +1147,7 @@ onUnmounted(() => {
               <label for="morph-toggle" class="toggle"></label>
             </div>
           </div>
-          <div v-if="!isWindows && layerCount <= 3" class="field row">
+          <div v-if="layerCount <= 3" class="field row">
             <div class="field-label">Glass</div>
             <div class="toggle-wrap">
               <input type="checkbox" v-model="glassEnabled" id="glass-toggle" class="toggle-input" />
@@ -1084,7 +1155,7 @@ onUnmounted(() => {
             </div>
           </div>
           <Transition name="fade">
-            <div v-if="glassEnabled && !isWindows && layerCount <= 3">
+            <div v-if="glassEnabled && layerCount <= 3">
               <div class="field">
                 <div class="field-label">Frost <span class="field-value">{{ glassFrost.toFixed(2) }}</span></div>
                 <input type="range" v-model.number="glassFrost" min="0" max="1" step="0.01" class="slider" />
@@ -1139,9 +1210,12 @@ onUnmounted(() => {
       <div class="actions">
         <div class="actions-row">
           <button class="btn-secondary" @click="restorePrev" :disabled="!hasPrev || morphingEnabled">↩ Back</button>
-          <button class="btn-secondary" @click="download" :disabled="!hasGenerated">↓ Download</button>
+          <button class="btn-secondary" @click="download" :disabled="!hasGenerated || downloading">
+            <span v-if="downloading" class="spinner"></span>
+            {{ downloading ? 'Preparing…' : '↓ Download' }}
+          </button>
         </div>
-        <button class="btn-generate" @click="generate" :disabled="generating || morphingEnabled">
+        <button class="btn-generate" @click="generate" :disabled="generating || morphingEnabled || downloading">
           <span v-if="generating" class="spinner"></span>
           {{ generating ? 'Generating…' : 'Generate' }}
         </button>
@@ -1152,11 +1226,14 @@ onUnmounted(() => {
 
     <div class="mobile-bar">
       <button class="mbar-btn" @click="restorePrev" :disabled="!hasPrev || morphingEnabled">↩</button>
-      <button class="mbar-generate" @click="generate" :disabled="generating || morphingEnabled">
+      <button class="mbar-generate" @click="generate" :disabled="generating || morphingEnabled || downloading">
         <span v-if="generating" class="spinner"></span>
         {{ generating ? '…' : 'Generate' }}
       </button>
-      <button class="mbar-btn" @click="download" :disabled="!hasGenerated">↓</button>
+      <button class="mbar-btn" @click="download" :disabled="!hasGenerated || downloading">
+        <span v-if="downloading" class="spinner"></span>
+        <span v-else>↓</span>
+      </button>
       <button class="mbar-btn mbar-settings" @click="showSettings = !showSettings" :class="{ active: showSettings }">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -1583,6 +1660,10 @@ onUnmounted(() => {
   cursor: pointer;
   transition: all 0.15s;
   white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .btn-secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
