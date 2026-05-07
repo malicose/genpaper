@@ -20,7 +20,14 @@ const ACT_CODES: Record<Activation, string> = {
 const activation  = ref<Activation>('smooth')
 const activation2 = ref<Activation>('wave')
 const dualActivation = ref(false)
-const layerCount = ref(3)
+const networkType = ref<'cppn' | 'siren'>('cppn')
+const sirenOmega = ref(70)
+const _cppnDepth = ref(3)
+const _sirenDepth = ref(7)
+const layerCount = computed({
+  get: () => networkType.value === 'siren' ? _sirenDepth.value : _cppnDepth.value,
+  set: (v: number) => { if (networkType.value === 'siren') _sirenDepth.value = v; else _cppnDepth.value = v },
+})
 const colorMode = ref<'rgb' | 'bw' | 'palette'>('rgb')
 const stops = ref(['#0d0221', '#9b1d6b', '#f5a623'])
 
@@ -157,13 +164,32 @@ function randn(rng: Rng): number {
 }
 
 // --- Network ---
+const INPUT_SIZE = 11 // x,y,r + z×8
+
 function makeWeights(rng: Rng): Layer[] {
   const outSize = colorMode.value === 'rgb' ? 3 : 1
-  const sizes = [11, ...Array(layerCount.value).fill(32), outSize]
+  const sizes = [INPUT_SIZE, ...Array(layerCount.value).fill(32), outSize]
   return sizes.slice(1).map((o: number, i: number) => ({
     w: Array.from({ length: o }, () => Array.from({ length: sizes[i] as number }, () => randn(rng))),
     b: Array.from({ length: o }, () => randn(rng)),
   }))
+}
+
+function makeSirenWeights(rng: Rng): Layer[] {
+  const outSize = colorMode.value === 'rgb' ? 3 : 1
+  const sizes = [INPUT_SIZE, ...Array(layerCount.value).fill(32), outSize]
+  return sizes.slice(1).map((o: number, i: number) => {
+    const inSz = sizes[i] as number
+    const wScale = i === 0 ? sirenOmega.value / inSz : Math.sqrt(6 / inSz)
+    return {
+      w: Array.from({ length: o }, () => Array.from({ length: inSz }, () => (rng() * 2 - 1) * wScale)),
+      b: Array.from({ length: o }, () => (rng() * 2 - 1) * wScale),
+    }
+  })
+}
+
+function makeNetworkWeights(rng: Rng): Layer[] {
+  return networkType.value === 'siren' ? makeSirenWeights(rng) : makeWeights(rng)
 }
 function makeZ(rng: Rng): number[] {
   return Array.from({ length: 8 }, () => randn(rng))
@@ -201,15 +227,17 @@ function stopsFlat(): Float32Array {
 
 // --- Dynamic GLSL fragment shader ---
 function makeFragSrc(layers: Layer[]): string {
-  const sizes = [11, ...layers.map(l => l.b.length)]
+  const sizes = [layers[0]!.w[0]!.length, ...layers.map(l => l.b.length)]
   const N = layers.length
 
   const offsets: number[] = [0]
   for (let l = 0; l < N; l++)
     offsets.push(offsets[l]! + sizes[l]! * sizes[l + 1]! + sizes[l + 1]!)
 
-  const actCode1 = ACT_CODES[activation.value]
-  const actCode2 = ACT_CODES[activation2.value]
+  const isSiren = networkType.value === 'siren'
+  const actCode1 = ACT_CODES[isSiren ? 'wave' : activation.value]
+  const actCode2 = ACT_CODES[isSiren ? 'wave' : activation2.value]
+  const effDual = !isSiren && dualActivation.value
 
   let fwd = `float inp[${sizes[0]}];
   inp[0]=x;inp[1]=y;inp[2]=r;
@@ -219,7 +247,7 @@ function makeFragSrc(layers: Layer[]): string {
     const inSz = sizes[l]!, outSz = sizes[l + 1]!
     const wOff = offsets[l]!, bOff = wOff + inSz * outSz
     const prev = l === 0 ? 'inp' : `h${l - 1}`
-    const fn   = l === N - 1 ? 'sig' : (dualActivation.value && l % 2 !== 0 ? 'act2' : 'act1')
+    const fn   = l === N - 1 ? 'sig' : (effDual && l % 2 !== 0 ? 'act2' : 'act1')
     fwd += `float h${l}[${outSz}];
   for(int o=0;o<${outSz};o++){
     float s=W(${bOff}+o);
@@ -368,9 +396,9 @@ function renderWithWorker(layers: Layer[], z: number[]): Promise<void> {
     cpuWorker.postMessage({
       width: w, height: h,
       layers, z,
-      activation: activation.value,
-      activation2: activation2.value,
-      dualActivation: dualActivation.value,
+      activation: networkType.value === 'siren' ? 'wave' : activation.value,
+      activation2: networkType.value === 'siren' ? 'wave' : activation2.value,
+      dualActivation: networkType.value === 'siren' ? false : dualActivation.value,
       colorMode: colorMode.value,
       stops: stopsRgb,
       grainSeed: Math.random() * 99999,
@@ -381,6 +409,7 @@ function renderWithWorker(layers: Layer[], z: number[]): Promise<void> {
 
 // --- Generate ---
 async function generate() {
+  if (generating.value) return
   stopMorphing()
   morphingEnabled.value = false
   generating.value = true
@@ -388,7 +417,7 @@ async function generate() {
 
   const rng = makeRng()
   if (currentWeights.length) { prevWeights = currentWeights; prevZ = currentZ; hasPrev.value = true }
-  const weights = makeWeights(rng)
+  const weights = makeNetworkWeights(rng)
   currentZ = makeZ(rng)
   currentWeights = weights
 
@@ -408,7 +437,7 @@ async function generate() {
 // --- Morphing ---
 function startMorphing() {
   animating = true
-  const weights = makeWeights(makeRng())
+  const weights = makeNetworkWeights(makeRng())
   uploadWeights(weights)
   buildProgram(weights)
   let zA = makeZ(Math.random), zB = makeZ(Math.random), t = 0
@@ -449,9 +478,9 @@ function download() {
     dlWorker.postMessage({
       width: w, height: h,
       layers: currentWeights, z: currentZ,
-      activation: activation.value,
-      activation2: activation2.value,
-      dualActivation: dualActivation.value,
+      activation: networkType.value === 'siren' ? 'wave' : activation.value,
+      activation2: networkType.value === 'siren' ? 'wave' : activation2.value,
+      dualActivation: networkType.value === 'siren' ? false : dualActivation.value,
       colorMode: colorMode.value,
       stops: stopsRgb,
       grainSeed: Math.random() * 99999,
@@ -550,6 +579,15 @@ watch(layerCount, () => {
   else if (hasGenerated.value) generate()
 })
 
+watch(networkType, () => {
+  if (morphingEnabled.value) { stopMorphing(); startMorphing() }
+  else generate()
+})
+
+watch(sirenOmega, () => {
+  if (networkType.value === 'siren') generate()
+})
+
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 
 watch([grainEnabled, grainLevel], async () => {
@@ -623,6 +661,14 @@ onUnmounted(() => {
         <section class="group">
           <div class="group-title">Shape</div>
           <div class="field">
+            <div class="field-label">Style</div>
+            <div class="segment-control">
+              <button :class="['seg-btn', networkType === 'cppn' && 'active']" @click="networkType = 'cppn'">Organic</button>
+              <button :class="['seg-btn', networkType === 'siren' && 'active']" @click="networkType = 'siren'">Fluid</button>
+            </div>
+          </div>
+          <template v-if="networkType === 'cppn'">
+          <div class="field">
             <div class="field-label">
               Style
               <button class="act-add-btn" @click="dualActivation = !dualActivation" :title="dualActivation ? 'Remove blend' : 'Add blend'">{{ dualActivation ? '−' : '+' }}</button>
@@ -653,6 +699,13 @@ onUnmounted(() => {
                 <option value="bell">bell</option>
                 <option value="slope">slope</option>
                 </select>
+            </div>
+          </Transition>
+          </template>
+          <Transition name="fade">
+            <div v-if="networkType === 'siren'" class="field">
+              <div class="field-label">Frequency <span class="field-value">{{ sirenOmega }}</span></div>
+              <input type="range" v-model.number="sirenOmega" min="5" max="80" step="1" class="slider" />
             </div>
           </Transition>
           <div class="field">
