@@ -529,7 +529,7 @@ function removeStop(i: number) {
 
 watch(colorMode, () => { morphingEnabled.value ? (stopMorphing(), startMorphing()) : generate() })
 
-watch([activation, activation2, layerCount, dualActivation], async () => {
+watch([activation, activation2, dualActivation], async () => {
   if (morphingEnabled.value) { stopMorphing(); startMorphing() }
   else if (hasGenerated.value) {
     generating.value = true
@@ -543,6 +543,11 @@ watch([activation, activation2, layerCount, dualActivation], async () => {
     }
     generating.value = false
   }
+})
+
+watch(layerCount, () => {
+  if (morphingEnabled.value) { stopMorphing(); startMorphing() }
+  else if (hasGenerated.value) generate()
 })
 
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
