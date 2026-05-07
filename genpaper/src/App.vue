@@ -36,6 +36,10 @@ const seedValue = ref(42)
 const morphingEnabled = ref(false)
 const grainEnabled = ref(false)
 const grainLevel = ref(0.15)
+const glassEnabled = ref(false)
+const glassFrost = ref(0.45)
+const glassRefraction = ref(0.8)
+const glassSize = ref(0.55)
 const aspectRatio = ref<'1:1' | '16:9' | '9:16'>('1:1')
 
 const DISPLAY = { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] } as const
@@ -134,7 +138,17 @@ function extractAccent() {
 let gl: WebGL2RenderingContext | null = null
 let vs: WebGLShader | null = null
 let program: WebGLProgram | null = null
+let glassProgram: WebGLProgram | null = null
+let blurProg: WebGLProgram | null = null
 let weightTex: WebGLTexture | null = null
+let framebuffer: WebGLFramebuffer | null = null
+let fbTexture: WebGLTexture | null = null
+let fbBlurFb: WebGLFramebuffer | null = null
+let fbBlurTex: WebGLTexture | null = null
+let fbBlur2Fb: WebGLFramebuffer | null = null
+let fbBlur2Tex: WebGLTexture | null = null
+let fbWidth = 0
+let fbHeight = 0
 let texSize = 1
 let animating = false
 let currentZ: number[] = []
@@ -302,6 +316,135 @@ void main(){
 }`
 }
 
+// --- Glass shader ---
+// 11-tap horizontal Gaussian (sigma = 2*step), step in pixels
+function makeBlurSrc(): string {
+  return `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform sampler2D u_tex;
+uniform vec2 u_res;
+uniform float u_step;
+uniform vec2 u_dir;
+void main(){
+  vec2 uv=gl_FragCoord.xy/u_res;
+  vec2 d=u_dir*u_step/u_res;
+  vec3 c=texture(u_tex,uv).rgb*0.2006;
+  c+=(texture(u_tex,clamp(uv+d*1.408,0.,1.))+texture(u_tex,clamp(uv-d*1.408,0.,1.))).rgb*0.2987;
+  c+=(texture(u_tex,clamp(uv+d*3.294,0.,1.))+texture(u_tex,clamp(uv-d*3.294,0.,1.))).rgb*0.0922;
+  c+=(texture(u_tex,clamp(uv+d*5.0,0.,1.))+texture(u_tex,clamp(uv-d*5.0,0.,1.))).rgb*0.0088;
+  fragColor=vec4(c,1.);
+}`
+}
+
+function makeGlassSrc(): string {
+  return `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform sampler2D u_scene;
+uniform sampler2D u_hblurred;
+uniform vec2 u_res;
+uniform float u_frost;
+uniform vec4 u_glass;
+uniform float u_corner;
+
+float sdRBox(vec2 p,vec2 b,float r){
+  vec2 q=abs(p)-b+r;
+  return length(max(q,0.))+min(max(q.x,q.y),0.)-r;
+}
+
+void main(){
+  vec2 uv=gl_FragCoord.xy/u_res;
+  uv.y=1.-uv.y;
+  float asp=u_res.x/u_res.y;
+  vec2 p=(uv-u_glass.xy)*vec2(asp,1.);
+  vec2 b=u_glass.zw*vec2(asp,1.);
+  float cr=u_corner*asp;
+  float d=sdRBox(p,b,cr);
+  if(d>0.008){fragColor=texture(u_scene,uv);return;}
+  float inside=smoothstep(0.004,-0.001,d);
+  float eps=0.003;
+  float nx=sdRBox(p+vec2(eps,0.),b,cr)-sdRBox(p-vec2(eps,0.),b,cr);
+  float ny=sdRBox(p+vec2(0.,eps),b,cr)-sdRBox(p-vec2(0.,eps),b,cr);
+  vec2 nrm=normalize(vec2(nx,ny)+vec2(1e-6));
+  vec2 nrmDir=normalize(nrm*vec2(1./asp,1.));
+  // Pure blurred interior — no sharp scene sampling, no artifacts
+  vec3 glass=texture(u_hblurred,uv).rgb;
+  glass*=vec3(1.01,1.02,1.06);
+  glass+=0.025*(1.-u_frost*0.6);
+  float rimBand=smoothstep(0.007,0.001,d)-smoothstep(0.001,-0.004,d);
+  float rimDir=max(0.,dot(-nrmDir,normalize(vec2(1.,1.))));
+  glass+=rimBand*(0.04+rimDir*0.38);
+  float shadowDir=max(0.,dot(nrmDir,normalize(vec2(1.,1.))));
+  glass-=rimBand*shadowDir*0.1;
+  fragColor=vec4(clamp(mix(texture(u_scene,uv).rgb,glass,inside),0.,1.),1.);
+}`
+}
+
+function buildGlassProgram() {
+  const g = gl!
+  if (glassProgram) g.deleteProgram(glassProgram)
+  const gfs = compileShader(g.FRAGMENT_SHADER, makeGlassSrc())
+  glassProgram = g.createProgram()!
+  g.attachShader(glassProgram, vs!); g.attachShader(glassProgram, gfs)
+  g.linkProgram(glassProgram); g.deleteShader(gfs)
+
+  if (blurProg) g.deleteProgram(blurProg)
+  const bfs = compileShader(g.FRAGMENT_SHADER, makeBlurSrc())
+  blurProg = g.createProgram()!
+  g.attachShader(blurProg, vs!); g.attachShader(blurProg, bfs)
+  g.linkProgram(blurProg); g.deleteShader(bfs)
+}
+
+function makeFbTex(g: WebGL2RenderingContext, w: number, h: number): WebGLTexture {
+  const t = g.createTexture()!
+  g.bindTexture(g.TEXTURE_2D, t)
+  g.texImage2D(g.TEXTURE_2D, 0, g.RGBA8, w, h, 0, g.RGBA, g.UNSIGNED_BYTE, null)
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.LINEAR)
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR)
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE)
+  g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE)
+  return t
+}
+
+function makeFb(g: WebGL2RenderingContext, tex: WebGLTexture): WebGLFramebuffer {
+  const fb = g.createFramebuffer()!
+  g.bindFramebuffer(g.FRAMEBUFFER, fb)
+  g.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex, 0)
+  g.bindFramebuffer(g.FRAMEBUFFER, null)
+  return fb
+}
+
+function ensureFramebuffer(w: number, h: number) {
+  if (fbWidth === w && fbHeight === h && framebuffer) return
+  const g = gl!
+  if (fbTexture) g.deleteTexture(fbTexture)
+  if (framebuffer) g.deleteFramebuffer(framebuffer)
+  if (fbBlurTex) g.deleteTexture(fbBlurTex)
+  if (fbBlurFb) g.deleteFramebuffer(fbBlurFb)
+  fbTexture = makeFbTex(g, w, h); framebuffer = makeFb(g, fbTexture)
+  fbBlurTex = makeFbTex(g, w, h); fbBlurFb = makeFb(g, fbBlurTex)
+  fbBlur2Tex = makeFbTex(g, w, h); fbBlur2Fb = makeFb(g, fbBlur2Tex)
+  fbWidth = w; fbHeight = h
+}
+
+function setGlassUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h: number) {
+  const hw = glassSize.value * 0.5
+  g.uniform2f(g.getUniformLocation(prog, 'u_res'), w, h)
+  g.uniform1i(g.getUniformLocation(prog, 'u_scene'), 0)
+  g.uniform1i(g.getUniformLocation(prog, 'u_hblurred'), 1)
+  g.uniform1f(g.getUniformLocation(prog, 'u_frost'), glassFrost.value)
+  g.uniform4f(g.getUniformLocation(prog, 'u_glass'), 0.5, 0.5, hw, hw)
+  g.uniform1f(g.getUniformLocation(prog, 'u_corner'), glassSize.value * 0.07)
+}
+
+function setBlurUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h: number, dx: number, dy: number) {
+  g.uniform1i(g.getUniformLocation(prog, 'u_tex'), 0)
+  g.uniform2f(g.getUniformLocation(prog, 'u_res'), w, h)
+  g.uniform1f(g.getUniformLocation(prog, 'u_step'), glassFrost.value * Math.min(w, h) * 0.04)
+  g.uniform2f(g.getUniformLocation(prog, 'u_dir'), dx, dy)
+}
+
 // --- WebGL setup ---
 function compileShader(type: number, src: string): WebGLShader {
   const s = gl!.createShader(type)!
@@ -317,7 +460,7 @@ function initGL() {
   if (!g) { alert('WebGL 2 not supported in this browser'); return }
   gl = g
   vs = compileShader(g.VERTEX_SHADER,
-    `#version 300 es\nin vec2 p;\nvoid main(){gl_Position=vec4(p,0,1);}`)
+    `#version 300 es\nlayout(location=0) in vec2 p;\nvoid main(){gl_Position=vec4(p,0,1);}`)
   g.bindBuffer(g.ARRAY_BUFFER, g.createBuffer())
   g.bufferData(g.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), g.STATIC_DRAW)
 }
@@ -365,9 +508,53 @@ function setUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h
 function draw(z: number[]) {
   if (!gl || !program) return
   const el = canvas.value!
-  gl.viewport(0, 0, el.width, el.height)
-  setUniforms(gl, program, el.width, el.height, z)
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+  const w = el.width, h = el.height
+  const g = gl
+
+  if (glassEnabled.value && glassProgram && blurProg) {
+    ensureFramebuffer(w, h)
+    // Pass 1: scene → fbTexture
+    g.bindFramebuffer(g.FRAMEBUFFER, framebuffer)
+    g.viewport(0, 0, w, h)
+    g.useProgram(program)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, weightTex)
+    setUniforms(g, program, w, h, z)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+    // Pass 2: H-blur fbTexture → fbBlurTex
+    g.bindFramebuffer(g.FRAMEBUFFER, fbBlurFb)
+    g.viewport(0, 0, w, h)
+    g.useProgram(blurProg)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, fbTexture)
+    setBlurUniforms(g, blurProg, w, h, 1, 0)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+    // Pass 3: V-blur fbBlurTex → fbBlur2Tex
+    g.bindFramebuffer(g.FRAMEBUFFER, fbBlur2Fb)
+    g.viewport(0, 0, w, h)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, fbBlurTex)
+    setBlurUniforms(g, blurProg, w, h, 0, 1)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+    // Pass 4: glass composite → screen
+    g.bindFramebuffer(g.FRAMEBUFFER, null)
+    g.viewport(0, 0, w, h)
+    g.useProgram(glassProgram)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, fbTexture)
+    g.activeTexture(g.TEXTURE1)
+    g.bindTexture(g.TEXTURE_2D, fbBlur2Tex)
+    setGlassUniforms(g, glassProgram, w, h)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+  } else {
+    g.bindFramebuffer(g.FRAMEBUFFER, null)
+    g.viewport(0, 0, w, h)
+    g.useProgram(program)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, weightTex)
+    setUniforms(g, program, w, h, z)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+  }
 }
 
 function captureBg() {
@@ -498,29 +685,93 @@ function download() {
     const s = g.createShader(type)!
     g.shaderSource(s, src); g.compileShader(s); return s
   }
-  const prog = g.createProgram()!
-  g.attachShader(prog, comp(g.VERTEX_SHADER, `#version 300 es\nin vec2 p;\nvoid main(){gl_Position=vec4(p,0,1);}`))
-  g.attachShader(prog, comp(g.FRAGMENT_SHADER, makeFragSrc(currentWeights)))
-  g.linkProgram(prog); g.useProgram(prog)
+  const vsrc = `#version 300 es\nlayout(location=0) in vec2 p;\nvoid main(){gl_Position=vec4(p,0,1);}`
+  const dlVs = comp(g.VERTEX_SHADER, vsrc)
+
   g.bindBuffer(g.ARRAY_BUFFER, g.createBuffer())
   g.bufferData(g.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), g.STATIC_DRAW)
-  const loc = g.getAttribLocation(prog, 'p')
-  g.enableVertexAttribArray(loc); g.vertexAttribPointer(loc, 2, g.FLOAT, false, 0, 0)
+  g.enableVertexAttribArray(0)
+  g.vertexAttribPointer(0, 2, g.FLOAT, false, 0, 0)
+
+  const prog = g.createProgram()!
+  g.attachShader(prog, dlVs)
+  g.attachShader(prog, comp(g.FRAGMENT_SHADER, makeFragSrc(currentWeights)))
+  g.linkProgram(prog)
 
   const data = packWeights(currentWeights)
   const ts = Math.ceil(Math.sqrt(data.length))
   const padded = new Float32Array(ts * ts); padded.set(data)
-  g.bindTexture(g.TEXTURE_2D, g.createTexture())
+  const wTex = g.createTexture()
+  g.bindTexture(g.TEXTURE_2D, wTex)
   g.texImage2D(g.TEXTURE_2D, 0, g.R32F, ts, ts, 0, g.RED, g.FLOAT, padded)
   g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST)
   g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST)
 
-  g.viewport(0, 0, w, h)
-  // override texSize temporarily for offscreen context
   const savedTs = texSize; texSize = ts
-  setUniforms(g, prog, w, h, currentZ)
+
+  if (glassEnabled.value) {
+    const dlSceneTex = makeFbTex(g, w, h)
+    const dlSceneFb = makeFb(g, dlSceneTex)
+    const dlBlurTex = makeFbTex(g, w, h)
+    const dlBlurFb = makeFb(g, dlBlurTex)
+
+    // Pass 1: scene → dlSceneTex
+    g.bindFramebuffer(g.FRAMEBUFFER, dlSceneFb)
+    g.viewport(0, 0, w, h)
+    g.useProgram(prog)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, wTex)
+    setUniforms(g, prog, w, h, currentZ)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+
+    const dlBlur2Tex = makeFbTex(g, w, h)
+    const dlBlur2Fb = makeFb(g, dlBlur2Tex)
+    const bProg = g.createProgram()!
+    g.attachShader(bProg, dlVs)
+    g.attachShader(bProg, comp(g.FRAGMENT_SHADER, makeBlurSrc()))
+    g.linkProgram(bProg)
+
+    // Pass 2: H-blur dlSceneTex → dlBlurTex
+    g.bindFramebuffer(g.FRAMEBUFFER, dlBlurFb)
+    g.viewport(0, 0, w, h)
+    g.useProgram(bProg)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, dlSceneTex)
+    setBlurUniforms(g, bProg, w, h, 1, 0)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+
+    // Pass 3: V-blur dlBlurTex → dlBlur2Tex
+    g.bindFramebuffer(g.FRAMEBUFFER, dlBlur2Fb)
+    g.viewport(0, 0, w, h)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, dlBlurTex)
+    setBlurUniforms(g, bProg, w, h, 0, 1)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+
+    // Pass 4: glass composite → canvas
+    const gProg = g.createProgram()!
+    g.attachShader(gProg, dlVs)
+    g.attachShader(gProg, comp(g.FRAGMENT_SHADER, makeGlassSrc()))
+    g.linkProgram(gProg)
+    g.bindFramebuffer(g.FRAMEBUFFER, null)
+    g.viewport(0, 0, w, h)
+    g.useProgram(gProg)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, dlSceneTex)
+    g.activeTexture(g.TEXTURE1)
+    g.bindTexture(g.TEXTURE_2D, dlBlur2Tex)
+    setGlassUniforms(g, gProg, w, h)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+  } else {
+    g.viewport(0, 0, w, h)
+    g.useProgram(prog)
+    g.activeTexture(g.TEXTURE0)
+    g.bindTexture(g.TEXTURE_2D, wTex)
+    setUniforms(g, prog, w, h, currentZ)
+    g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+  }
+
   texSize = savedTs
-  g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
 
   offscreen.toBlob(blob => {
     const url = URL.createObjectURL(blob!)
@@ -590,6 +841,17 @@ watch(sirenOmega, () => {
 
 watch(morphingEnabled, (on) => (on ? startMorphing() : stopMorphing()))
 
+watch([glassEnabled, glassFrost, glassRefraction, glassSize], async () => {
+  if (glassEnabled.value && !glassProgram) buildGlassProgram()
+  if (animating || !hasGenerated.value) return
+  if (isWindows) {
+    await renderWithWorker(currentWeights, currentZ)
+  } else {
+    draw(currentZ)
+    captureBg()
+  }
+})
+
 watch([grainEnabled, grainLevel], async () => {
   if (animating) return
   if (isWindows) {
@@ -629,6 +891,16 @@ onMounted(() => {
 onUnmounted(() => {
   stopMorphing()
   cpuWorker?.terminate()
+  if (gl) {
+    if (framebuffer) gl.deleteFramebuffer(framebuffer)
+    if (fbTexture) gl.deleteTexture(fbTexture)
+    if (fbBlurFb) gl.deleteFramebuffer(fbBlurFb)
+    if (fbBlurTex) gl.deleteTexture(fbBlurTex)
+    if (fbBlur2Fb) gl.deleteFramebuffer(fbBlur2Fb)
+    if (fbBlur2Tex) gl.deleteTexture(fbBlur2Tex)
+    if (glassProgram) gl.deleteProgram(glassProgram)
+    if (blurProg) gl.deleteProgram(blurProg)
+  }
 })
 </script>
 
@@ -752,6 +1024,29 @@ onUnmounted(() => {
               <label for="morph-toggle" class="toggle"></label>
             </div>
           </div>
+          <div v-if="!isWindows" class="field row">
+            <div class="field-label">Glass</div>
+            <div class="toggle-wrap">
+              <input type="checkbox" v-model="glassEnabled" id="glass-toggle" class="toggle-input" />
+              <label for="glass-toggle" class="toggle"></label>
+            </div>
+          </div>
+          <Transition name="fade">
+            <div v-if="glassEnabled && !isWindows">
+              <div class="field">
+                <div class="field-label">Frost <span class="field-value">{{ glassFrost.toFixed(2) }}</span></div>
+                <input type="range" v-model.number="glassFrost" min="0" max="1" step="0.01" class="slider" />
+              </div>
+              <div class="field">
+                <div class="field-label">Refraction <span class="field-value">{{ glassRefraction.toFixed(2) }}</span></div>
+                <input type="range" v-model.number="glassRefraction" min="0" max="1" step="0.01" class="slider" />
+              </div>
+              <div class="field">
+                <div class="field-label">Size <span class="field-value">{{ glassSize.toFixed(2) }}</span></div>
+                <input type="range" v-model.number="glassSize" min="0.1" max="0.9" step="0.01" class="slider" />
+              </div>
+            </div>
+          </Transition>
         </section>
 
         <section class="group">
