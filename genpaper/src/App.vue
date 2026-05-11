@@ -171,6 +171,7 @@ let texSize = 1
 let khrExt: { COMPLETION_STATUS_KHR: number } | null = null
 
 // --- WebGPU state ---
+const gpuReady = ref(false)
 let gpuDevice: GPUDevice | null = null
 let gpuContext: GPUCanvasContext | null = null
 let gpuCanvasFormat: GPUTextureFormat = 'bgra8unorm'
@@ -809,7 +810,9 @@ async function initGPU(): Promise<boolean> {
   gpuDevice.lost.then((info) => {
     console.warn(`[GP] WebGPU device lost: ${info.reason} — ${info.message}`)
     gpuDevice = null; gpuContext = null; gpuPipeline = null; gpuUniformBuf = null; gpuWeightTex = null; gpuBindGroup = null
+    gpuReady.value = false
   })
+  gpuReady.value = true
   console.log(`[GP] WebGPU: init OK, format=${gpuCanvasFormat}`)
   return true
 }
@@ -971,15 +974,21 @@ async function generate() {
 async function startMorphing() {
   animating = true
   const weights = makeNetworkWeights(makeRng())
-  uploadWeights(weights)
-  await buildProgram(weights)
+  if (gpuDevice) {
+    await buildPipelineGPU(weights)
+    uploadWeightsGPU(weights)
+  } else {
+    uploadWeights(weights)
+    await buildProgram(weights)
+  }
   if (!animating) return
   let zA = makeZ(Math.random), zB = makeZ(Math.random), t = 0
   function step() {
     if (!animating) return
     t += 0.004
     if (t >= 1) { t = 0; zA = zB; zB = makeZ(Math.random) }
-    draw(lerpZ(zA, zB, smoothstep(t)))
+    if (gpuDevice) drawGPU(lerpZ(zA, zB, smoothstep(t)))
+    else draw(lerpZ(zA, zB, smoothstep(t)))
     requestAnimationFrame(step)
   }
   step()
@@ -988,7 +997,60 @@ async function startMorphing() {
 function stopMorphing() { animating = false }
 
 // --- Download (offscreen 4K render) ---
+async function downloadWithGPU() {
+  if (!gpuDevice || !gpuPipeline || !gpuWeightTex) return
+  downloading.value = true
+  const [w, h] = EXPORT[aspectRatio.value]
+  const device = gpuDevice
+
+  const offscreen = new OffscreenCanvas(w, h)
+  const dlCtx = offscreen.getContext('webgpu') as GPUCanvasContext | null
+  if (!dlCtx) { downloading.value = false; return }
+  dlCtx.configure({ device, format: gpuCanvasFormat, alphaMode: 'opaque' })
+
+  const dlUniformBuf = device.createBuffer({ size: GPU_UNIFORM_BYTES, usage: 0x40 | 0x08 })
+  const ab = new ArrayBuffer(GPU_UNIFORM_BYTES)
+  const f32 = new Float32Array(ab); const u32 = new Uint32Array(ab)
+  f32[0] = w; f32[1] = h; u32[2] = gpuTexSize
+  f32[3] = (grainEnabled.value && !glassEnabled.value) ? grainLevel.value : 0.0
+  f32[4] = currentZ[0]!; f32[5] = currentZ[1]!; f32[6] = currentZ[2]!; f32[7] = currentZ[3]!
+  f32[8] = currentZ[4]!; f32[9] = currentZ[5]!; f32[10] = currentZ[6]!; f32[11] = currentZ[7]!
+  u32[12] = colorMode.value === 'palette' ? stops.value.length : 0
+  const sf = stopsFlat()
+  for (let i = 0; i < MAX_STOPS; i++) { f32[16+i*4]=sf[i*3]!; f32[17+i*4]=sf[i*3+1]!; f32[18+i*4]=sf[i*3+2]! }
+  device.queue.writeBuffer(dlUniformBuf, 0, ab)
+
+  const dlBindGroup = device.createBindGroup({
+    layout: gpuPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: dlUniformBuf } },
+      { binding: 1, resource: gpuWeightTex.createView() },
+    ],
+  })
+
+  const enc = device.createCommandEncoder()
+  const pass = enc.beginRenderPass({ colorAttachments: [{
+    view: dlCtx.getCurrentTexture().createView(),
+    clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store',
+  }]})
+  pass.setPipeline(gpuPipeline)
+  pass.setBindGroup(0, dlBindGroup)
+  pass.draw(4)
+  pass.end()
+  device.queue.submit([enc.finish()])
+  await device.queue.onSubmittedWorkDone()
+  dlUniformBuf.destroy()
+
+  const blob = await offscreen.convertToBlob({ type: 'image/png' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = `wallpaper-${aspectRatio.value.replace(':', 'x')}-${Date.now()}.png`
+  a.click(); URL.revokeObjectURL(url)
+  downloading.value = false
+}
+
 function download() {
+  if (gpuDevice) { downloadWithGPU(); return }
   if (isWindows) {
     downloading.value = true
     const [w, h] = EXPORT[aspectRatio.value]
@@ -1516,7 +1578,7 @@ onUnmounted(() => {
               <input type="range" v-model.number="grainLevel" min="0.02" max="0.5" step="0.01" class="slider" />
             </div>
           </Transition>
-          <div v-if="!isWindows" class="field row">
+          <div v-if="!isWindows || gpuReady" class="field row">
             <div class="field-label">Morph</div>
             <div class="toggle-wrap">
               <input type="checkbox" v-model="morphingEnabled" id="morph-toggle" class="toggle-input" />
