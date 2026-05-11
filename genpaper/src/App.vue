@@ -17,6 +17,17 @@ const ACT_CODES: Record<Activation, string> = {
   bell:   'return 2./(exp(x)+exp(-x));',
   slope:  'return atan(x);',
 }
+const ACT_CODES_WGSL: Record<Activation, string> = {
+  smooth: 'return tanh(x);',
+  wave:   'return sin(x);',
+  drift:  'return cos(x);',
+  soft:   'if(x>20.0){return x;} return log(1.0+exp(x));',
+  ring:   'if(x==0.0){return 1.0;} return sin(x)/x;',
+  glow:   'return exp(-x*x);',
+  bend:   'return x/(1.0+exp(-x));',
+  bell:   'return 2.0/(exp(x)+exp(-x));',
+  slope:  'return atan(x);',
+}
 const activation  = ref<Activation>('smooth')
 const activation2 = ref<Activation>('wave')
 const dualActivation = ref(false)
@@ -44,7 +55,11 @@ const glassBlobCount = ref(6)
 const glassBlobSmooth = ref(0.25)
 const aspectRatio = ref<'1:1' | '16:9' | '9:16'>('1:1')
 
-const DISPLAY = { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] } as const
+const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
+const HIDDEN_SIZE = isWindows ? 16 : 32
+const DISPLAY: Record<'1:1' | '16:9' | '9:16', [number, number]> = isWindows
+  ? { '1:1': [256, 256], '16:9': [256, 144], '9:16': [144, 256] }
+  : { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] }
 const EXPORT  = { '1:1': [3840, 3840], '16:9': [3840, 2160], '9:16': [2160, 3840] } as const
 const canvasW = computed(() => DISPLAY[aspectRatio.value][0])
 const canvasH = computed(() => DISPLAY[aspectRatio.value][1])
@@ -153,6 +168,18 @@ let fbBlur2Tex: WebGLTexture | null = null
 let fbWidth = 0
 let fbHeight = 0
 let texSize = 1
+let khrExt: { COMPLETION_STATUS_KHR: number } | null = null
+
+// --- WebGPU state ---
+let gpuDevice: GPUDevice | null = null
+let gpuContext: GPUCanvasContext | null = null
+let gpuCanvasFormat: GPUTextureFormat = 'bgra8unorm'
+let gpuPipeline: GPURenderPipeline | null = null
+let gpuUniformBuf: GPUBuffer | null = null
+let gpuWeightTex: GPUTexture | null = null
+let gpuBindGroup: GPUBindGroup | null = null
+let gpuTexSize = 1
+const GPU_UNIFORM_BYTES = 256
 let animating = false
 let currentZ: number[] = []
 let currentWeights: Layer[] = []
@@ -161,7 +188,6 @@ let prevZ: number[] = []
 const hasPrev = ref(false)
 let glassBlobs: Float32Array = new Float32Array(36)
 
-const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 let cpuWorker: Worker | null = null
 
 // --- PRNG ---
@@ -186,7 +212,7 @@ const INPUT_SIZE = 11 // x,y,r + z×8
 
 function makeWeights(rng: Rng): Layer[] {
   const outSize = colorMode.value === 'rgb' ? 3 : 1
-  const sizes = [INPUT_SIZE, ...Array(layerCount.value).fill(32), outSize]
+  const sizes = [INPUT_SIZE, ...Array(layerCount.value).fill(HIDDEN_SIZE), outSize]
   return sizes.slice(1).map((o: number, i: number) => ({
     w: Array.from({ length: o }, () => Array.from({ length: sizes[i] as number }, () => randn(rng))),
     b: Array.from({ length: o }, () => randn(rng)),
@@ -195,7 +221,7 @@ function makeWeights(rng: Rng): Layer[] {
 
 function makeSirenWeights(rng: Rng): Layer[] {
   const outSize = colorMode.value === 'rgb' ? 3 : 1
-  const sizes = [INPUT_SIZE, ...Array(layerCount.value).fill(32), outSize]
+  const sizes = [INPUT_SIZE, ...Array(layerCount.value).fill(HIDDEN_SIZE), outSize]
   return sizes.slice(1).map((o: number, i: number) => {
     const inSz = sizes[i] as number
     const wScale = i === 0 ? sirenOmega.value / inSz : Math.sqrt(6 / inSz)
@@ -317,6 +343,101 @@ void main(){
   ${colLine}
   float g=(noise(gl_FragCoord.xy)-0.5)*u_grain;
   fragColor=vec4(clamp(col+g,0.,1.),1.);
+}`
+}
+
+// --- Dynamic WGSL fragment shader ---
+// Uniform buffer layout (256 bytes, matches GPU_UNIFORM_BYTES):
+//   0:  res (vec2f)   8: ts (u32)   12: grain (f32)
+//   16: z0 (vec4f, z[0..3])   32: z1 (vec4f, z[4..7])
+//   48: nstops (u32)  52-60: padding
+//   64: stops (array<vec4f,12>)
+function makeFragWGSL(layers: Layer[]): string {
+  const sizes = [layers[0]!.w[0]!.length, ...layers.map(l => l.b.length)]
+  const N = layers.length
+
+  const offsets: number[] = [0]
+  for (let l = 0; l < N; l++)
+    offsets.push(offsets[l]! + sizes[l]! * sizes[l + 1]! + sizes[l + 1]!)
+
+  const isSiren = networkType.value === 'siren'
+  const actCode1 = ACT_CODES_WGSL[isSiren ? 'wave' : activation.value]
+  const actCode2 = ACT_CODES_WGSL[isSiren ? 'wave' : activation2.value]
+  const effDual = !isSiren && dualActivation.value
+
+  const inputSize = sizes[0]!
+
+  // forward pass — WGSL uses i32 loop vars with unique names per layer
+  let fwd = `var inp: array<f32, ${inputSize}>;
+  inp[0]=x; inp[1]=y; inp[2]=r;
+  inp[3]=u.z0.x; inp[4]=u.z0.y; inp[5]=u.z0.z; inp[6]=u.z0.w;
+  inp[7]=u.z1.x; inp[8]=u.z1.y; inp[9]=u.z1.z; inp[10]=u.z1.w;
+  `
+  for (let l = 0; l < N; l++) {
+    const inSz = sizes[l]!, outSz = sizes[l + 1]!
+    const wOff = offsets[l]!, bOff = wOff + inSz * outSz
+    const prev = l === 0 ? 'inp' : `h${l - 1}`
+    const fn   = l === N - 1 ? 'sig' : (effDual && l % 2 !== 0 ? 'act2' : 'act1')
+    fwd += `var h${l}: array<f32, ${outSz}>;
+  for(var o${l}: i32=0; o${l}<${outSz}; o${l}++){
+    var s${l}: f32=W(${bOff}+o${l});
+    for(var i${l}: i32=0; i${l}<${inSz}; i${l}++){s${l}+=W(${wOff}+o${l}*${inSz}+i${l})*${prev}[i${l}];}
+    h${l}[o${l}]=${fn}(s${l});
+  }
+  `
+  }
+
+  const mode = colorMode.value
+  const last = `h${N - 1}`
+  const colLine = mode === 'rgb'
+    ? `var col: vec3f = vec3f(${last}[0], ${last}[1], ${last}[2]);`
+    : mode === 'bw'
+    ? `var col: vec3f = vec3f(${last}[0]);`
+    : `var col: vec3f = palette(${last}[0]);`
+
+  const paletteFn = mode === 'palette' ? `
+fn palette(t: f32) -> vec3f {
+  let ns: i32 = i32(u.nstops);
+  for(var i: i32=0; i<ns-1; i++){
+    let ns1: f32 = f32(ns-1);
+    let t0: f32 = f32(i)/ns1;
+    let t1: f32 = f32(i+1)/ns1;
+    if(t<=t1){ return mix(u.stops[i].xyz, u.stops[i+1].xyz, (t-t0)/(t1-t0)); }
+  }
+  return u.stops[ns-1].xyz;
+}` : ''
+
+  return `struct Uniforms {
+  res: vec2f, ts: u32, grain: f32,
+  z0: vec4f, z1: vec4f,
+  nstops: u32, _p0: u32, _p1: u32, _p2: u32,
+  stops: array<vec4f, 12>,
+}
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var u_w: texture_2d<f32>;
+
+fn W(i: i32) -> f32 { return textureLoad(u_w, vec2i(i%i32(u.ts), i/i32(u.ts)), 0).r; }
+fn act1(x: f32) -> f32 { ${actCode1} }
+fn act2(x: f32) -> f32 { ${actCode2} }
+fn sig(x: f32) -> f32 { return 1.0/(1.0+exp(-x)); }
+fn noise(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(12.9898,78.233)))*43758.5453); }
+${paletteFn}
+
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  var pos = array<vec2f,4>(vec2f(-1.,-1.),vec2f(1.,-1.),vec2f(-1.,1.),vec2f(1.,1.));
+  return vec4f(pos[vi], 0., 1.);
+}
+
+@fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let c = pos.xy / u.res;
+  let asp = u.res.x / u.res.y;
+  let x = (c.x*2.0-1.0)*asp;
+  let y = (1.0-c.y)*2.0-1.0;
+  let r = length(vec2f(x, y));
+  ${fwd}
+  ${colLine}
+  let gv = (noise(pos.xy)-0.5)*u.grain;
+  return vec4f(clamp(col+gv, vec3f(0.0), vec3f(1.0)), 1.0);
 }`
 }
 
@@ -511,31 +632,73 @@ function compileShader(type: number, src: string): WebGLShader {
 }
 
 function initGL() {
+  console.log(`[GP] initGL: canvas ${canvas.value!.width}×${canvas.value!.height}, HIDDEN_SIZE=${HIDDEN_SIZE}`)
+  const t0 = performance.now()
   const g = canvas.value!.getContext('webgl2', { preserveDrawingBuffer: true })
-  if (!g) { alert('WebGL 2 not supported in this browser'); return }
+  if (!g) { if (!isWindows) alert('WebGL 2 not supported in this browser'); console.warn('[GP] initGL: WebGL2 context failed'); return }
+  console.log(`[GP] initGL: context OK (${(performance.now()-t0).toFixed(1)}ms)`)
   gl = g
+  khrExt = g.getExtension('KHR_parallel_shader_compile') as { COMPLETION_STATUS_KHR: number } | null
+  console.log(`[GP] initGL: KHR_parallel_shader_compile = ${khrExt ? 'YES' : 'NO'}`)
+  const t1 = performance.now()
   vs = compileShader(g.VERTEX_SHADER,
     `#version 300 es\nlayout(location=0) in vec2 p;\nvoid main(){gl_Position=vec4(p,0,1);}`)
+  console.log(`[GP] initGL: vertex shader compiled (${(performance.now()-t1).toFixed(1)}ms)`)
   g.bindBuffer(g.ARRAY_BUFFER, g.createBuffer())
   g.bufferData(g.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), g.STATIC_DRAW)
 }
 
-function buildProgram(layers: Layer[]) {
-  const g = gl!
-  if (program) g.deleteProgram(program)
-  const fs = compileShader(g.FRAGMENT_SHADER, makeFragSrc(layers))
-  program = g.createProgram()!
-  g.attachShader(program, vs!)
-  g.attachShader(program, fs)
-  g.linkProgram(program)
-  g.useProgram(program)
-  const loc = g.getAttribLocation(program, 'p')
-  g.enableVertexAttribArray(loc)
-  g.vertexAttribPointer(loc, 2, g.FLOAT, false, 0, 0)
+function buildProgram(layers: Layer[]): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const g = gl!
+    if (program) g.deleteProgram(program)
+    const t0 = performance.now()
+    const fs = compileShader(g.FRAGMENT_SHADER, makeFragSrc(layers))
+    program = g.createProgram()!
+    g.attachShader(program, vs!)
+    g.attachShader(program, fs)
+    g.linkProgram(program)
+    console.log(`[GP] buildProgram: shaders submitted (${(performance.now()-t0).toFixed(1)}ms), KHR=${khrExt ? 'YES' : 'NO'}`)
+
+    if (!khrExt) {
+      const t1 = performance.now()
+      g.useProgram(program)
+      console.log(`[GP] buildProgram: useProgram (no KHR, blocked ${(performance.now()-t1).toFixed(1)}ms), total=${(performance.now()-t0).toFixed(1)}ms`)
+      const loc = g.getAttribLocation(program, 'p')
+      g.enableVertexAttribArray(loc)
+      g.vertexAttribPointer(loc, 2, g.FLOAT, false, 0, 0)
+      resolve()
+      return
+    }
+
+    let frames = 0
+    function poll() {
+      frames++
+      if (g.getProgramParameter(program!, khrExt!.COMPLETION_STATUS_KHR) === true) {
+        console.log(`[GP] buildProgram: KHR ready after ${frames} frames (${(performance.now()-t0).toFixed(1)}ms)`)
+        g.useProgram(program!)
+        const loc = g.getAttribLocation(program!, 'p')
+        g.enableVertexAttribArray(loc)
+        g.vertexAttribPointer(loc, 2, g.FLOAT, false, 0, 0)
+        resolve()
+      } else if (frames > 500) {
+        console.warn(`[GP] buildProgram: KHR timeout after ${frames} frames, forcing useProgram`)
+        g.useProgram(program!)
+        const loc = g.getAttribLocation(program!, 'p')
+        g.enableVertexAttribArray(loc)
+        g.vertexAttribPointer(loc, 2, g.FLOAT, false, 0, 0)
+        resolve()
+      } else {
+        requestAnimationFrame(poll)
+      }
+    }
+    requestAnimationFrame(poll)
+  })
 }
 
 function uploadWeights(layers: Layer[]) {
   const g = gl!
+  const t0 = performance.now()
   const data = packWeights(layers)
   texSize = Math.ceil(Math.sqrt(data.length))
   const padded = new Float32Array(texSize * texSize)
@@ -546,6 +709,7 @@ function uploadWeights(layers: Layer[]) {
   g.texImage2D(g.TEXTURE_2D, 0, g.R32F, texSize, texSize, 0, g.RED, g.FLOAT, padded)
   g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST)
   g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST)
+  console.log(`[GP] uploadWeights: ${data.length} floats, texSize=${texSize} (${(performance.now()-t0).toFixed(1)}ms)`)
 }
 
 function setUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h: number, z: number[]) {
@@ -608,13 +772,123 @@ function draw(z: number[]) {
     g.activeTexture(g.TEXTURE0)
     g.bindTexture(g.TEXTURE_2D, weightTex)
     setUniforms(g, program, w, h, z)
+    const t0 = performance.now()
     g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+    console.log(`[GP] draw: drawArrays ${w}×${h} (${(performance.now()-t0).toFixed(1)}ms)`)
   }
 }
 
 function captureBg() {
-  bgUrl.value = canvas.value!.toDataURL('image/jpeg', 0.6)
-  extractAccent()
+  // Defer toDataURL to next rAF: on Windows, reading GPU pixels synchronously
+  // blocks the main thread even after gl.finish(), because the real GPU→CPU
+  // transfer doesn't happen until the browser compositor releases the framebuffer.
+  requestAnimationFrame(() => {
+    if (!canvas.value) return
+    console.log('[GP] captureBg: toDataURL...')
+    const t0 = performance.now()
+    bgUrl.value = canvas.value.toDataURL('image/jpeg', 0.6)
+    console.log(`[GP] captureBg: done (${(performance.now()-t0).toFixed(1)}ms)`)
+    extractAccent()
+  })
+}
+
+// --- WebGPU ---
+async function initGPU(): Promise<boolean> {
+  if (!navigator.gpu) { console.log('[GP] WebGPU: navigator.gpu not available'); return false }
+  const adapter = await navigator.gpu.requestAdapter()
+  if (!adapter) { console.log('[GP] WebGPU: no adapter'); return false }
+  try {
+    gpuDevice = await adapter.requestDevice()
+  } catch (e) { console.log('[GP] WebGPU: requestDevice failed', e); return false }
+  const ctx = canvas.value!.getContext('webgpu') as GPUCanvasContext | null
+  if (!ctx) { console.log('[GP] WebGPU: getContext failed'); gpuDevice = null; return false }
+  gpuContext = ctx
+  gpuCanvasFormat = navigator.gpu.getPreferredCanvasFormat()
+  ctx.configure({ device: gpuDevice, format: gpuCanvasFormat, alphaMode: 'opaque' })
+  gpuUniformBuf = gpuDevice.createBuffer({ size: GPU_UNIFORM_BYTES, usage: 0x40 | 0x08 /* UNIFORM | COPY_DST */ })
+  gpuDevice.lost.then((info) => {
+    console.warn(`[GP] WebGPU device lost: ${info.reason} — ${info.message}`)
+    gpuDevice = null; gpuContext = null; gpuPipeline = null; gpuUniformBuf = null; gpuWeightTex = null; gpuBindGroup = null
+  })
+  console.log(`[GP] WebGPU: init OK, format=${gpuCanvasFormat}`)
+  return true
+}
+
+async function buildPipelineGPU(layers: Layer[]): Promise<void> {
+  const device = gpuDevice!
+  const t0 = performance.now()
+  // createShaderModule + createRenderPipelineAsync is the correct non-blocking path.
+  // getCompilationInfo() before pipeline creation can synchronously block the main
+  // thread on Windows D3D12 while WGSL→DXIL compiles — skip it here.
+  const mod = device.createShaderModule({ code: makeFragWGSL(layers) })
+  console.log(`[GP] buildPipelineGPU: module submitted (${(performance.now()-t0).toFixed(1)}ms)`)
+  const bgl = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: 0x2 /* FRAGMENT */, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: 0x2 /* FRAGMENT */, texture: { sampleType: 'unfilterable-float' } },
+  ]})
+  gpuPipeline = await device.createRenderPipelineAsync({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    vertex:   { module: mod, entryPoint: 'vs_main' },
+    fragment: { module: mod, entryPoint: 'fs_main', targets: [{ format: gpuCanvasFormat }] },
+    primitive: { topology: 'triangle-strip' },
+  })
+  console.log(`[GP] buildPipelineGPU: pipeline ready (${(performance.now()-t0).toFixed(1)}ms)`)
+  // Log any WGSL errors after pipeline is ready (already compiled, fast round-trip)
+  const info = await mod.getCompilationInfo()
+  for (const m of info.messages)
+    if (m.type === 'error') console.error(`[GP] WGSL error line ${m.lineNum}: ${m.message}`)
+}
+
+function uploadWeightsGPU(layers: Layer[]): void {
+  const device = gpuDevice!
+  const data = packWeights(layers)
+  gpuTexSize = Math.ceil(Math.sqrt(data.length))
+  const padded = new Float32Array(gpuTexSize * gpuTexSize)
+  padded.set(data)
+  if (gpuWeightTex) gpuWeightTex.destroy()
+  gpuWeightTex = device.createTexture({
+    size: [gpuTexSize, gpuTexSize], format: 'r32float',
+    usage: 0x04 | 0x02 /* TEXTURE_BINDING | COPY_DST */,
+  })
+  device.queue.writeTexture({ texture: gpuWeightTex }, padded, { bytesPerRow: gpuTexSize * 4 }, [gpuTexSize, gpuTexSize])
+  gpuBindGroup = device.createBindGroup({
+    layout: gpuPipeline!.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: gpuUniformBuf! } },
+      { binding: 1, resource: gpuWeightTex.createView() },
+    ],
+  })
+  console.log(`[GP] uploadWeightsGPU: ${data.length} floats, texSize=${gpuTexSize}`)
+}
+
+function drawGPU(z: number[]): void {
+  const device = gpuDevice!
+  const el = canvas.value!
+  const w = el.width, h = el.height
+  // pack uniform buffer
+  const ab = new ArrayBuffer(GPU_UNIFORM_BYTES)
+  const f = new Float32Array(ab)
+  const u32 = new Uint32Array(ab)
+  f[0] = w;  f[1] = h
+  u32[2] = gpuTexSize
+  f[3] = (grainEnabled.value && !glassEnabled.value) ? grainLevel.value : 0.0
+  f[4] = z[0]!; f[5] = z[1]!; f[6] = z[2]!; f[7] = z[3]!
+  f[8] = z[4]!; f[9] = z[5]!; f[10] = z[6]!; f[11] = z[7]!
+  u32[12] = colorMode.value === 'palette' ? stops.value.length : 0
+  const sf = stopsFlat()
+  for (let i = 0; i < MAX_STOPS; i++) { f[16+i*4]=sf[i*3]!; f[17+i*4]=sf[i*3+1]!; f[18+i*4]=sf[i*3+2]! }
+  device.queue.writeBuffer(gpuUniformBuf!, 0, ab)
+  // render pass
+  const enc = device.createCommandEncoder()
+  const pass = enc.beginRenderPass({ colorAttachments: [{
+    view: gpuContext!.getCurrentTexture().createView(),
+    clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store',
+  }]})
+  pass.setPipeline(gpuPipeline!)
+  pass.setBindGroup(0, gpuBindGroup!)
+  pass.draw(4)
+  pass.end()
+  device.queue.submit([enc.finish()])
 }
 
 // --- CPU Worker render ---
@@ -671,13 +945,22 @@ async function generate() {
   glassBlobs = makeGlassBlobs(rng)
   currentWeights = weights
 
-  if (isWindows) {
-    await renderWithWorker(currentWeights, currentZ)
-  } else {
-    buildProgram(weights)
-    uploadWeights(weights)
-    draw(currentZ)
-    captureBg()
+  try {
+    if (gpuDevice) {
+      await buildPipelineGPU(weights)
+      uploadWeightsGPU(weights)
+      drawGPU(currentZ)
+      captureBg()
+    } else if (gl) {
+      await buildProgram(weights)
+      uploadWeights(weights)
+      draw(currentZ)
+      captureBg()
+    } else {
+      await renderWithWorker(currentWeights, currentZ)
+    }
+  } catch (e) {
+    console.error('[GP] render error:', e)
   }
 
   generating.value = false
@@ -685,11 +968,12 @@ async function generate() {
 }
 
 // --- Morphing ---
-function startMorphing() {
+async function startMorphing() {
   animating = true
   const weights = makeNetworkWeights(makeRng())
   uploadWeights(weights)
-  buildProgram(weights)
+  await buildProgram(weights)
+  if (!animating) return
   let zA = makeZ(Math.random), zB = makeZ(Math.random), t = 0
   function step() {
     if (!animating) return
@@ -902,13 +1186,18 @@ async function restorePrev() {
   currentWeights = prevWeights; currentZ = prevZ; hasPrev.value = false
   generating.value = true
 
-  if (isWindows) {
-    await renderWithWorker(currentWeights, currentZ)
-  } else {
-    buildProgram(currentWeights)
+  if (gpuDevice) {
+    await buildPipelineGPU(currentWeights)
+    uploadWeightsGPU(currentWeights)
+    drawGPU(currentZ)
+    captureBg()
+  } else if (gl) {
+    await buildProgram(currentWeights)
     uploadWeights(currentWeights)
     draw(currentZ)
     captureBg()
+  } else {
+    await renderWithWorker(currentWeights, currentZ)
   }
 
   generating.value = false
@@ -1006,13 +1295,18 @@ watch([activation, activation2, dualActivation], async () => {
   if (morphingEnabled.value) { stopMorphing(); startMorphing() }
   else if (hasGenerated.value) {
     generating.value = true
-    if (isWindows) {
-      await renderWithWorker(currentWeights, currentZ)
-    } else {
-      buildProgram(currentWeights)
+    if (gpuDevice) {
+      await buildPipelineGPU(currentWeights)
+      uploadWeightsGPU(currentWeights)
+      drawGPU(currentZ)
+      captureBg()
+    } else if (gl) {
+      await buildProgram(currentWeights)
       uploadWeights(currentWeights)
       draw(currentZ)
       captureBg()
+    } else {
+      await renderWithWorker(currentWeights, currentZ)
     }
     generating.value = false
   }
@@ -1045,44 +1339,39 @@ watch([glassEnabled, glassFrost, glassRefraction, glassSize, glassBlobCount, gla
     if (glassBlobs[2] === 0) glassBlobs = makeGlassBlobs(Math.random)
   }
   if (animating || !hasGenerated.value) return
-  if (isWindows) {
-    await renderWithWorker(currentWeights, currentZ)
-  } else {
-    draw(currentZ)
-    captureBg()
-  }
+  if (gpuDevice) { drawGPU(currentZ); captureBg() }
+  else if (gl) { draw(currentZ); captureBg() }
+  else { await renderWithWorker(currentWeights, currentZ) }
 })
 
 watch([grainEnabled, grainLevel], async () => {
   if (animating) return
-  if (isWindows) {
-    await renderWithWorker(currentWeights, currentZ)
-  } else {
-    draw(currentZ)
-  }
+  if (gpuDevice) { drawGPU(currentZ) }
+  else if (gl) { draw(currentZ) }
+  else { await renderWithWorker(currentWeights, currentZ) }
 })
 
 watch(aspectRatio, generate, { flush: 'post' })
 
 watch(stops, async () => {
   if (animating || !hasGenerated.value) return
-  if (isWindows) {
-    await renderWithWorker(currentWeights, currentZ)
-  } else {
-    draw(currentZ)
-  }
+  if (gpuDevice) { drawGPU(currentZ) }
+  else if (gl) { draw(currentZ) }
+  else { await renderWithWorker(currentWeights, currentZ) }
 }, { deep: true })
 
 const isMobile = ref(typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false)
 let mq: MediaQueryList
 
-onMounted(() => {
+onMounted(async () => {
   mq = window.matchMedia('(max-width: 767px)')
   isMobile.value = mq.matches
   mq.addEventListener('change', (e) => { isMobile.value = e.matches })
 
   if (isWindows) {
     cpuWorker = new Worker(new URL('./render.worker.ts', import.meta.url), { type: 'module' })
+    const gpuOk = await initGPU()
+    if (!gpuOk) initGL()
   } else {
     initGL()
   }
@@ -1092,6 +1381,11 @@ onMounted(() => {
 onUnmounted(() => {
   stopMorphing()
   cpuWorker?.terminate()
+  if (gpuDevice) {
+    gpuUniformBuf?.destroy()
+    gpuWeightTex?.destroy()
+    gpuDevice.destroy()
+  }
   if (gl) {
     if (framebuffer) gl.deleteFramebuffer(framebuffer)
     if (fbTexture) gl.deleteTexture(fbTexture)
