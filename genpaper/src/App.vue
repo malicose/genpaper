@@ -58,7 +58,7 @@ const aspectRatio = ref<'1:1' | '16:9' | '9:16'>('1:1')
 const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 const HIDDEN_SIZE = isWindows ? 16 : 32
 const DISPLAY: Record<'1:1' | '16:9' | '9:16', [number, number]> = isWindows
-  ? { '1:1': [256, 256], '16:9': [256, 144], '9:16': [144, 256] }
+  ? { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] }
   : { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] }
 const EXPORT  = { '1:1': [3840, 3840], '16:9': [3840, 2160], '9:16': [2160, 3840] } as const
 const canvasW = computed(() => DISPLAY[aspectRatio.value][0])
@@ -1470,7 +1470,7 @@ onUnmounted(() => {
   }">
     <div v-if="bgUrl" class="bg-blur" :style="{ backgroundImage: `url(${bgUrl})` }" />
     <main class="canvas-wrap">
-      <canvas ref="canvas" :width="canvasW" :height="canvasH" class="canvas" />
+      <canvas ref="canvas" :width="canvasW*2" :height="canvasH*2" class="canvas" />
     </main>
 
     <Transition name="backdrop">
@@ -2193,7 +2193,7 @@ onUnmounted(() => {
     flex: none;
   }
 
-  .canvas { max-height: 100vw; }
+  .canvas { max-height: 150vw; }
 
   /* Sidebar becomes a bottom sheet */
   .sidebar {
