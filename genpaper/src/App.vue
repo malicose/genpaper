@@ -60,9 +60,11 @@ const HIDDEN_SIZE = isWindows ? 16 : 32
 const DISPLAY: Record<'1:1' | '16:9' | '9:16', [number, number]> = isWindows
   ? { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] }
   : { '1:1': [512, 512], '16:9': [512, 288], '9:16': [288, 512] }
+const MUSIC_DISPLAY: Record<'1:1' | '16:9' | '9:16', [number, number]> =
+  { '1:1': [256, 256], '16:9': [256, 144], '9:16': [144, 256] }
 const EXPORT  = { '1:1': [3840, 3840], '16:9': [3840, 2160], '9:16': [2160, 3840] } as const
-const canvasW = computed(() => DISPLAY[aspectRatio.value][0])
-const canvasH = computed(() => DISPLAY[aspectRatio.value][1])
+const canvasW = computed(() => (appMode.value === 'music' ? MUSIC_DISPLAY : DISPLAY)[aspectRatio.value][0])
+const canvasH = computed(() => (appMode.value === 'music' ? MUSIC_DISPLAY : DISPLAY)[aspectRatio.value][1])
 
 const MAX_STOPS = 12
 
@@ -182,7 +184,7 @@ let gpuUniformBuf: GPUBuffer | null = null
 let gpuWeightTex: GPUTexture | null = null
 let gpuBindGroup: GPUBindGroup | null = null
 let gpuTexSize = 1
-const GPU_UNIFORM_BYTES = 256
+const GPU_UNIFORM_BYTES = 272 // +16 bytes for zoom/panx/pany/actblend at offset 256
 let animating = false
 let currentZ: number[] = []
 let currentWeights: Layer[] = []
@@ -190,6 +192,42 @@ let prevWeights: Layer[] = []
 let prevZ: number[] = []
 const hasPrev = ref(false)
 let glassBlobs: Float32Array = new Float32Array(36)
+
+// --- Music mode ---
+const appMode = ref<'visual' | 'music'>('visual')
+const audioSource = ref<'mic' | 'system'>('mic')
+const audioActive = ref(false)
+const audioError = ref('')
+let audioCtx: AudioContext | null = null
+let audioAnalyser: AnalyserNode | null = null
+let audioStream: MediaStream | null = null
+let audioAnimId: number | null = null
+let audioZa: number[] = []
+let audioZb: number[] = []
+let audioMorphT = 0
+const audioVizCanvas = ref<HTMLCanvasElement | null>(null)
+let savedLayerCount = 3
+// Audio shader overrides (written each frame, read by setUniforms/drawGPU)
+let audioGrainLevel = 0
+let audioZoom       = 1
+let audioPanX       = 0
+let audioPanY       = 0
+let audioActBlend   = 0
+let prevBandSub  = 0  // previous-frame energies for onset detection
+let prevBandMid  = 0
+let prevBandHigh = 0
+let kickCooldown  = 0  // frames until next kick can trigger
+let snareCooldown = 0
+let hatCooldown   = 0
+let dispKick   = 0    // display values, decay each frame
+let dispSnare  = 0
+let dispHat    = 0
+let dispBass   = 0
+let dispMelody = 0
+const audioBassSens  = ref(1.0)
+const audioMidSens   = ref(1.0)
+const audioHighSens  = ref(1.0)
+const audioMorphSpeed = ref(4)
 
 let cpuWorker: Worker | null = null
 
@@ -300,7 +338,7 @@ function makeFragSrc(layers: Layer[]): string {
     const inSz = sizes[l]!, outSz = sizes[l + 1]!
     const wOff = offsets[l]!, bOff = wOff + inSz * outSz
     const prev = l === 0 ? 'inp' : `h${l - 1}`
-    const fn   = l === N - 1 ? 'sig' : (effDual && l % 2 !== 0 ? 'act2' : 'act1')
+    const fn   = l === N - 1 ? 'sig' : (effDual && l % 2 !== 0 ? 'actB' : 'actA')
     fwd += `float h${l}[${outSz}];
   for(int o=0;o<${outSz};o++){
     float s=W(${bOff}+o);
@@ -337,17 +375,23 @@ uniform int u_ts;
 uniform vec2 u_res;
 uniform float u_z[8];
 uniform float u_grain;
+uniform float u_zoom;
+uniform float u_panx;
+uniform float u_pany;
+uniform float u_actblend;
 ${paletteUniforms}
 float W(int i){return texelFetch(u_w,ivec2(i%u_ts,i/u_ts),0).r;}
 float act1(float x){${actCode1}}
 float act2(float x){${actCode2}}
+float actA(float x){return mix(act1(x),act2(x),u_actblend);}
+float actB(float x){return mix(act2(x),act1(x),u_actblend);}
 float sig(float x){return 1./(1.+exp(-x));}
 float noise(vec2 p){return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453);}
 ${paletteFn}
 void main(){
   vec2 c=gl_FragCoord.xy/u_res;
   float asp=u_res.x/u_res.y;
-  float x=(c.x*2.-1.)*asp,y=(1.-c.y)*2.-1.,r=length(vec2(x,y));
+  float x=((c.x*2.-1.)*asp+u_panx)*u_zoom,y=((1.-c.y)*2.-1.+u_pany)*u_zoom,r=length(vec2(x,y));
   ${fwd}
   ${colLine}
   float g=(noise(gl_FragCoord.xy)-0.5)*u_grain;
@@ -356,11 +400,12 @@ void main(){
 }
 
 // --- Dynamic WGSL fragment shader ---
-// Uniform buffer layout (256 bytes, matches GPU_UNIFORM_BYTES):
+// Uniform buffer layout (272 bytes, matches GPU_UNIFORM_BYTES):
 //   0:  res (vec2f)   8: ts (u32)   12: grain (f32)
 //   16: z0 (vec4f, z[0..3])   32: z1 (vec4f, z[4..7])
 //   48: nstops (u32)  52-60: padding
 //   64: stops (array<vec4f,12>)
+//   256: zoom (f32)  260: panx (f32)  264: pany (f32)  268: actblend (f32)
 function makeFragWGSL(layers: Layer[]): string {
   const sizes = [layers[0]!.w[0]!.length, ...layers.map(l => l.b.length)]
   const N = layers.length
@@ -386,7 +431,7 @@ function makeFragWGSL(layers: Layer[]): string {
     const inSz = sizes[l]!, outSz = sizes[l + 1]!
     const wOff = offsets[l]!, bOff = wOff + inSz * outSz
     const prev = l === 0 ? 'inp' : `h${l - 1}`
-    const fn   = l === N - 1 ? 'sig' : (effDual && l % 2 !== 0 ? 'act2' : 'act1')
+    const fn   = l === N - 1 ? 'sig' : (effDual && l % 2 !== 0 ? 'actB' : 'actA')
     fwd += `var h${l}: array<f32, ${outSz}>;
   for(var o${l}: i32=0; o${l}<${outSz}; o${l}++){
     var s${l}: f32=W(${bOff}+o${l});
@@ -421,6 +466,7 @@ fn palette(t: f32) -> vec3f {
   z0: vec4f, z1: vec4f,
   nstops: u32, _p0: u32, _p1: u32, _p2: u32,
   stops: array<vec4f, 12>,
+  zoom: f32, panx: f32, pany: f32, actblend: f32,
 }
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var u_w: texture_2d<f32>;
@@ -428,6 +474,8 @@ fn palette(t: f32) -> vec3f {
 fn W(i: i32) -> f32 { return textureLoad(u_w, vec2i(i%i32(u.ts), i/i32(u.ts)), 0).r; }
 fn act1(x: f32) -> f32 { ${actCode1} }
 fn act2(x: f32) -> f32 { ${actCode2} }
+fn actA(x: f32) -> f32 { return mix(act1(x), act2(x), u.actblend); }
+fn actB(x: f32) -> f32 { return mix(act2(x), act1(x), u.actblend); }
 fn sig(x: f32) -> f32 { return 1.0/(1.0+exp(-x)); }
 fn noise(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(12.9898,78.233)))*43758.5453); }
 ${paletteFn}
@@ -440,8 +488,8 @@ ${paletteFn}
 @fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let c = pos.xy / u.res;
   let asp = u.res.x / u.res.y;
-  let x = (c.x*2.0-1.0)*asp;
-  let y = (1.0-c.y)*2.0-1.0;
+  let x = ((c.x*2.0-1.0)*asp + u.panx) * u.zoom;
+  let y = ((1.0-c.y)*2.0-1.0 + u.pany) * u.zoom;
   let r = length(vec2f(x, y));
   ${fwd}
   ${colLine}
@@ -726,7 +774,12 @@ function setUniforms(g: WebGL2RenderingContext, prog: WebGLProgram, w: number, h
   g.uniform1i(g.getUniformLocation(prog, 'u_ts'), texSize)
   g.uniform1fv(g.getUniformLocation(prog, 'u_z'), new Float32Array(z))
   g.uniform1i(g.getUniformLocation(prog, 'u_w'), 0)
-  g.uniform1f(g.getUniformLocation(prog, 'u_grain'), (grainEnabled.value && !glassEnabled.value) ? grainLevel.value : 0.0)
+  const au = audioActive.value
+  g.uniform1f(g.getUniformLocation(prog, 'u_grain'), au ? audioGrainLevel : (grainEnabled.value && !glassEnabled.value) ? grainLevel.value : 0.0)
+  g.uniform1f(g.getUniformLocation(prog, 'u_zoom'),     au ? audioZoom     : 1.0)
+  g.uniform1f(g.getUniformLocation(prog, 'u_panx'),     au ? audioPanX     : 0.0)
+  g.uniform1f(g.getUniformLocation(prog, 'u_pany'),     au ? audioPanY     : 0.0)
+  g.uniform1f(g.getUniformLocation(prog, 'u_actblend'), au ? audioActBlend : 0.0)
   if (colorMode.value === 'palette') {
     g.uniform1i(g.getUniformLocation(prog, 'u_nstops'), stops.value.length)
     g.uniform3fv(g.getUniformLocation(prog, 'u_stops'), stopsFlat())
@@ -882,12 +935,17 @@ function drawGPU(z: number[]): void {
   const u32 = new Uint32Array(ab)
   f[0] = w;  f[1] = h
   u32[2] = gpuTexSize
-  f[3] = (grainEnabled.value && !glassEnabled.value) ? grainLevel.value : 0.0
+  const au = audioActive.value
+  f[3] = au ? audioGrainLevel : (grainEnabled.value && !glassEnabled.value) ? grainLevel.value : 0.0
   f[4] = z[0]!; f[5] = z[1]!; f[6] = z[2]!; f[7] = z[3]!
   f[8] = z[4]!; f[9] = z[5]!; f[10] = z[6]!; f[11] = z[7]!
   u32[12] = colorMode.value === 'palette' ? stops.value.length : 0
   const sf = stopsFlat()
   for (let i = 0; i < MAX_STOPS; i++) { f[16+i*4]=sf[i*3]!; f[17+i*4]=sf[i*3+1]!; f[18+i*4]=sf[i*3+2]! }
+  f[64] = au ? audioZoom     : 1.0
+  f[65] = au ? audioPanX     : 0.0
+  f[66] = au ? audioPanY     : 0.0
+  f[67] = au ? audioActBlend : 0.0
   device.queue.writeBuffer(gpuUniformBuf!, 0, ab)
   // render pass
   const enc = device.createCommandEncoder()
@@ -946,6 +1004,8 @@ async function generate() {
   if (generating.value) return
   stopMorphing()
   morphingEnabled.value = false
+  const wasAudioActive = audioActive.value
+  if (wasAudioActive && audioAnimId !== null) { cancelAnimationFrame(audioAnimId); audioAnimId = null }
   if (hasGenerated.value && canvas.value) {
     transitionImg.value = canvas.value.toDataURL('image/jpeg', 0.8)
     showTransition.value = true
@@ -981,6 +1041,7 @@ async function generate() {
   generating.value = false
   hasGenerated.value = true
   showTransition.value = false
+  if (wasAudioActive) runAudioLoop()
 }
 
 // --- Morphing ---
@@ -1009,6 +1070,197 @@ async function startMorphing() {
 
 function stopMorphing() { animating = false }
 
+// --- Audio ---
+async function startAudio() {
+  audioError.value = ''
+  if (!navigator.mediaDevices) {
+    audioError.value = 'Требуется HTTPS или localhost — откройте через localhost:порт'
+    return
+  }
+  try {
+    let stream: MediaStream
+    if (audioSource.value === 'mic') {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } else {
+      stream = await navigator.mediaDevices.getDisplayMedia({ audio: true })
+      stream.getTracks().filter(t => t.kind === 'video').forEach(t => t.stop())
+      if (stream.getAudioTracks().length === 0) {
+        stream.getTracks().forEach(t => t.stop())
+        audioError.value = 'Нет звука — выбери "Весь экран" и включи чекбокс "Поделиться звуком системы"'
+        return
+      }
+    }
+    audioStream = stream
+    audioCtx = new AudioContext()
+    await audioCtx.resume()
+    audioAnalyser = audioCtx.createAnalyser()
+    audioAnalyser.fftSize = 256
+    audioAnalyser.smoothingTimeConstant = 0.65
+    const src = audioCtx.createMediaStreamSource(stream)
+    src.connect(audioAnalyser)
+    audioZa = Array.from({ length: 8 }, () => randn(Math.random.bind(Math)))
+    audioZb = Array.from({ length: 8 }, () => randn(Math.random.bind(Math)))
+    audioMorphT = 0
+    audioActive.value = true
+    runAudioLoop()
+  } catch (e) {
+    audioError.value = e instanceof Error ? e.message : 'Access denied'
+  }
+}
+
+function stopAudio() {
+  audioActive.value = false
+  if (audioAnimId !== null) { cancelAnimationFrame(audioAnimId); audioAnimId = null }
+  audioStream?.getTracks().forEach(t => t.stop())
+  audioStream = null
+  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null }
+  audioAnalyser = null
+  audioGrainLevel = 0; audioZoom = 1; audioPanX = 0; audioPanY = 0; audioActBlend = 0
+  prevBandSub = 0; prevBandMid = 0; prevBandHigh = 0
+  kickCooldown = 0; snareCooldown = 0; hatCooldown = 0
+  dispKick = 0; dispSnare = 0; dispHat = 0; dispBass = 0; dispMelody = 0
+  if (canvas.value) canvas.value.style.filter = ''
+}
+
+function runAudioLoop() {
+  if (!audioActive.value || !audioAnalyser) return
+  const bins = new Uint8Array(audioAnalyser.frequencyBinCount)
+  audioAnalyser.getByteFrequencyData(bins)
+  const n = bins.length
+  const band = (lo: number, hi: number) => {
+    let s = 0
+    const end = Math.min(hi, n)
+    for (let i = lo; i < end; i++) s += bins[i]! / 255
+    return s / Math.max(end - lo, 1)
+  }
+
+  // Band energies (172Hz/bin at 44.1kHz, 187Hz/bin at 48kHz)
+  const subNow  = band(0, 5)   // 0–860Hz:  kick sub, bass guitar
+  const midNow  = band(5, 40)  // 860–6880Hz: snare, melody, voice
+  const highNow = band(40, n)  // 6880–22kHz: hi-hat, cymbals
+
+  // Frame-to-frame onset: energy that appeared THIS frame
+  const subOnset  = Math.max(0, subNow  - prevBandSub)
+  const midOnset  = Math.max(0, midNow  - prevBandMid)
+  const highOnset = Math.max(0, highNow - prevBandHigh)
+  prevBandSub = subNow; prevBandMid = midNow; prevBandHigh = highNow
+
+  if (kickCooldown  > 0) kickCooldown--
+  if (snareCooldown > 0) snareCooldown--
+  if (hatCooldown   > 0) hatCooldown--
+
+  // Kick: dominant sub onset, sub must outweigh mid and high
+  const isKick  = kickCooldown  === 0 && subOnset  > 0.07 && subOnset > midOnset * 1.3 && subOnset > highOnset * 2.0
+  // Snare/clap: mid onset, not overshadowed by sub
+  const isSnare = snareCooldown === 0 && midOnset  > 0.05 && midOnset > subOnset * 0.8
+  // Hi-hat: high onset with no heavy bass beneath
+  const isHat   = hatCooldown   === 0 && highOnset > 0.03 && highOnset > midOnset * 0.6 && subNow < 0.25
+
+  if (isKick)  kickCooldown  = 12   // ~200ms at 60fps
+  if (isSnare) snareCooldown = 8    // ~130ms
+  if (isHat)   hatCooldown   = 4    // ~67ms
+
+  // Decay display values; spike to 1.0 on hit
+  dispKick   = isKick  ? 1.0 : Math.max(0, dispKick   - 0.10)
+  dispSnare  = isSnare ? 1.0 : Math.max(0, dispSnare  - 0.10)
+  dispHat    = isHat   ? 1.0 : Math.max(0, dispHat    - 0.10)
+  // Bass and melody: sustained level-based
+  dispBass   = subNow > 0.08 ? Math.min(1, dispBass   + 0.06) : Math.max(0, dispBass   - 0.025)
+  dispMelody = midNow > 0.06 ? Math.min(1, dispMelody + 0.05) : Math.max(0, dispMelody - 0.025)
+
+  const kickV  = dispKick   * audioBassSens.value
+  const snareV = dispSnare  * audioHighSens.value
+  const hatV   = dispHat    * audioHighSens.value
+  const bassV  = dispBass   * audioBassSens.value
+  const melV   = dispMelody * audioMidSens.value
+
+  // Morph: kick accelerates hardest, snare adds a little
+  audioMorphT += audioMorphSpeed.value * 0.001 + kickV * 0.08 + snareV * 0.02
+  if (audioMorphT >= 1) {
+    audioMorphT -= 1
+    audioZa = audioZb
+    audioZb = Array.from({ length: 8 }, () => randn(Math.random.bind(Math)))
+  }
+  const morphed = lerpZ(audioZa, audioZb, smoothstep(audioMorphT))
+
+  // Each instrument drives distinct z components
+  const push = [
+    kickV * 6 - 0.5, kickV * 6 - 0.5,
+    melV  * 3 - 0.3, melV  * 3 - 0.3, bassV * 3,
+    snareV * 7,       hatV  * 6,        (snareV + hatV) * 4,
+  ]
+  const z = morphed.map((v, i) => v + push[i]! * 0.5)
+
+  // Shader overrides
+  const pt = performance.now() * 0.0003
+  audioGrainLevel = (hatV + snareV) * 0.35
+  audioZoom       = 1.0 + kickV * 0.28
+  audioPanX       = Math.sin(pt * 0.7) * melV * 0.4
+  audioPanY       = Math.cos(pt * 0.5) * melV * 0.4
+  audioActBlend   = Math.min(snareV * 2.5, 1.0)
+
+  if (gpuDevice) drawGPU(z)
+  else if (gl) draw(z)
+
+  // CSS: kick → brightness flash, melody → hue drift
+  if (canvas.value) {
+    canvas.value.style.filter =
+      `brightness(${(1 + kickV * 2.5).toFixed(2)}) hue-rotate(${Math.round(melV * 180)}deg)`
+  }
+
+  // Visualizer
+  const viz = audioVizCanvas.value
+  if (viz) {
+    const vctx = viz.getContext('2d')!
+    const vw = viz.width, vh = viz.height
+    const barVh = 48
+    const instH = vh - barVh - 4
+    vctx.clearRect(0, 0, vw, vh)
+
+    // Frequency bars (power curve ^1.8 emphasises peaks)
+    const numBars = 32
+    const binsPerBar = Math.max(1, Math.floor(n / numBars))
+    const barW = vw / numBars
+    const hex2rgb = (hx: string) => [parseInt(hx.slice(1,3),16), parseInt(hx.slice(3,5),16), parseInt(hx.slice(5,7),16)] as const
+    const [r1,g1,b1] = hex2rgb(accentColor.value)
+    const [r2,g2,b2] = hex2rgb(accentColor2.value)
+    for (let i = 0; i < numBars; i++) {
+      let sum = 0
+      for (let j = 0; j < binsPerBar; j++) sum += bins[i * binsPerBar + j]! / 255
+      const barH = Math.ceil(Math.pow(sum / binsPerBar, 1.8) * barVh)
+      const tc = i / (numBars - 1)
+      vctx.fillStyle = `rgb(${Math.round(r1!+(r2!-r1!)*tc)},${Math.round(g1!+(g2!-g1!)*tc)},${Math.round(b1!+(b2!-b1!)*tc)})`
+      vctx.fillRect(Math.floor(i * barW) + 1, barVh - barH, Math.max(Math.ceil(barW) - 2, 1), barH)
+    }
+
+    // Instrument indicators
+    const insts: [string, number, string][] = [
+      ['KICK',   dispKick,   accentColor.value],
+      ['SNARE',  dispSnare,  accentColor2.value],
+      ['HAT',    dispHat,    accentColor2.value],
+      ['BASS',   dispBass,   accentColor.value],
+      ['MELODY', dispMelody, '#cccccc'],
+    ]
+    const instW = vw / insts.length
+    const instY = barVh + 4
+    vctx.font = 'bold 7px sans-serif'
+    vctx.textAlign = 'center'
+    vctx.textBaseline = 'middle'
+    for (const [i, [label, val, col]] of insts.entries()) {
+      const x = i * instW
+      vctx.globalAlpha = 0.12 + val * 0.88
+      vctx.fillStyle = col
+      vctx.fillRect(x + 1, instY, instW - 2, instH)
+      vctx.globalAlpha = 1
+      vctx.fillStyle = val > 0.5 ? '#000' : '#fff'
+      vctx.fillText(label, x + instW / 2, instY + instH / 2)
+    }
+    vctx.globalAlpha = 1
+  }
+
+  audioAnimId = requestAnimationFrame(runAudioLoop)
+}
+
 // --- Download (offscreen 4K render) ---
 async function downloadWithGPU() {
   if (!gpuDevice || !gpuPipeline || !gpuWeightTex) return
@@ -1031,6 +1283,7 @@ async function downloadWithGPU() {
   u32[12] = colorMode.value === 'palette' ? stops.value.length : 0
   const sf = stopsFlat()
   for (let i = 0; i < MAX_STOPS; i++) { f32[16+i*4]=sf[i*3]!; f32[17+i*4]=sf[i*3+1]!; f32[18+i*4]=sf[i*3+2]! }
+  f32[64] = 1.0; f32[65] = 0.0; f32[66] = 0.0; f32[67] = 0.0 // zoom/pan/actblend — neutral for export
   device.queue.writeBuffer(dlUniformBuf, 0, ab)
 
   const dlBindGroup = device.createBindGroup({
@@ -1428,6 +1681,23 @@ watch([grainEnabled, grainLevel], debounce(async () => {
 
 watch(aspectRatio, generate, { flush: 'post' })
 
+watch(appMode, async (mode) => {
+  if (mode === 'music') {
+    if (morphingEnabled.value) { stopMorphing(); morphingEnabled.value = false }
+    savedLayerCount = layerCount.value
+    if (layerCount.value > 5) layerCount.value = 5
+    await generate()
+  } else {
+    stopAudio()
+    if (layerCount.value !== savedLayerCount) layerCount.value = savedLayerCount
+    await generate()
+  }
+})
+
+watch(audioSource, () => {
+  if (audioActive.value) { stopAudio(); startAudio() }
+})
+
 watch(stops, debounce(async () => {
   if (animating || !hasGenerated.value) return
   if (gpuDevice) { drawGPU(currentZ) }
@@ -1455,6 +1725,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopMorphing()
+  stopAudio()
   cpuWorker?.terminate()
   if (gpuDevice) {
     gpuUniformBuf?.destroy()
@@ -1505,9 +1776,13 @@ onUnmounted(() => {
       </div>
       <div class="sidebar-header">
         <span class="logo" :style="{ backgroundImage: `linear-gradient(135deg, ${accentColor} 0%, ${accentColor2} 100%)` }">GenPaper</span>
+        <div class="segment-control mode-seg">
+          <button :class="['seg-btn', appMode === 'visual' && 'active']" @click="appMode = 'visual'">Visual</button>
+          <button :class="['seg-btn', appMode === 'music' && 'active']" @click="appMode = 'music'">Music</button>
+        </div>
       </div>
 
-      <div class="sidebar-body">
+      <div v-if="appMode === 'visual'" class="sidebar-body">
         <section class="group">
           <div class="group-title">Shape</div>
           <div class="field">
@@ -1666,17 +1941,68 @@ onUnmounted(() => {
         </section>
       </div>
 
+      <div v-else class="sidebar-body">
+        <section class="group">
+          <div class="group-title">Color</div>
+          <div class="segment-control">
+            <button :class="['seg-btn', colorMode === 'rgb' && 'active']" @click="colorMode = 'rgb'">RGB</button>
+            <button :class="['seg-btn', colorMode === 'bw' && 'active']" @click="colorMode = 'bw'">B&amp;W</button>
+            <button :class="['seg-btn', colorMode === 'palette' && 'active']" @click="colorMode = 'palette'">Palette</button>
+          </div>
+          <div class="field" style="margin-top:14px">
+            <div class="field-label">Depth <span class="field-value">{{ layerCount }}</span></div>
+            <input type="range" v-model.number="layerCount" min="1" max="5" class="slider" />
+          </div>
+        </section>
+        <section class="group">
+          <div class="group-title">Audio</div>
+          <div class="segment-control">
+            <button :class="['seg-btn', audioSource === 'mic' && 'active']" @click="audioSource = 'mic'">Mic</button>
+            <button :class="['seg-btn', audioSource === 'system' && 'active']" @click="audioSource = 'system'">System</button>
+          </div>
+          <p v-if="audioSource === 'system'" class="audio-hint">Windows + Chrome only — check "Share system audio" in the picker</p>
+          <div class="field row" style="margin-top:14px">
+            <div class="field-label">Listen</div>
+            <div class="toggle-wrap">
+              <input type="checkbox" :checked="audioActive" @change="audioActive ? stopAudio() : startAudio()" id="audio-toggle" class="toggle-input" />
+              <label for="audio-toggle" class="toggle"></label>
+            </div>
+          </div>
+          <div v-if="audioError" class="audio-error">{{ audioError }}</div>
+          <div v-if="audioActive" class="audio-status">● Listening</div>
+          <canvas v-if="audioActive" ref="audioVizCanvas" class="audio-viz" width="200" height="80" />
+          <template v-if="audioActive">
+            <div class="field" style="margin-top:14px">
+              <div class="field-label">Sub <span class="field-value">{{ audioBassSens.toFixed(1) }}</span></div>
+              <input type="range" v-model.number="audioBassSens" min="0" max="3" step="0.1" class="slider" />
+            </div>
+            <div class="field">
+              <div class="field-label">Melody <span class="field-value">{{ audioMidSens.toFixed(1) }}</span></div>
+              <input type="range" v-model.number="audioMidSens" min="0" max="3" step="0.1" class="slider" />
+            </div>
+            <div class="field">
+              <div class="field-label">Perc <span class="field-value">{{ audioHighSens.toFixed(1) }}</span></div>
+              <input type="range" v-model.number="audioHighSens" min="0" max="3" step="0.1" class="slider" />
+            </div>
+            <div class="field">
+              <div class="field-label">Speed <span class="field-value">{{ audioMorphSpeed }}</span></div>
+              <input type="range" v-model.number="audioMorphSpeed" min="1" max="10" step="1" class="slider" />
+            </div>
+          </template>
+        </section>
+      </div>
+
       <div class="actions">
         <div class="actions-row">
-          <button class="btn-secondary" @click="restorePrev" :disabled="!hasPrev || morphingEnabled">↩ Back</button>
+          <button v-if="appMode === 'visual'" class="btn-secondary" @click="restorePrev" :disabled="!hasPrev || morphingEnabled">↩ Back</button>
           <button class="btn-secondary" @click="download" :disabled="!hasGenerated || downloading">
             <span v-if="downloading" class="spinner"></span>
             {{ downloading ? 'Preparing…' : '↓ Download' }}
           </button>
         </div>
-        <button class="btn-generate" @click="generate" :disabled="generating || morphingEnabled || downloading">
+        <button class="btn-generate" @click="generate" :disabled="generating || (appMode === 'visual' && morphingEnabled) || downloading">
           <span v-if="generating" class="spinner"></span>
-          {{ generating ? 'Generating…' : 'Generate' }}
+          {{ generating ? 'Generating…' : appMode === 'music' ? 'New Pattern' : 'Generate' }}
         </button>
       </div>
       <button class="btn-close-sheet" @click="showSettings = false">Close</button>
@@ -1829,6 +2155,38 @@ onUnmounted(() => {
   -webkit-text-fill-color: transparent;
   background-clip: text;
   transition: background-image 0.6s ease;
+}
+
+.mode-seg { margin-top: 10px; }
+
+.audio-hint {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.audio-error {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #f87171;
+  line-height: 1.4;
+}
+
+.audio-status {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.audio-viz {
+  display: block;
+  width: 100%;
+  height: 80px;
+  margin-top: 10px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
 }
 
 .sidebar-body {
