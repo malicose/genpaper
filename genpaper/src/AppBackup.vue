@@ -43,7 +43,7 @@ const colorMode = ref<'rgb' | 'bw' | 'palette'>('rgb')
 const stops = ref(['#0d0221', '#9b1d6b', '#f5a623'])
 
 const seedEnabled = ref(false)
-const seedValue = ref(Math.floor(Math.random() * 0xFFFFFFFF))
+const seedValue = ref(42)
 const morphingEnabled = ref(false)
 const grainEnabled = ref(false)
 const grainLevel = ref(0.15)
@@ -69,14 +69,15 @@ const MAX_STOPS = 12
 // --- Runtime state ---
 const canvas = ref<HTMLCanvasElement | null>(null)
 const generating = ref(false)
-const transitionImg = ref('')
-const showTransition = ref(false)
 const downloading = ref(false)
 const hasGenerated = ref(false)
 const bgUrl = ref('')
 const showSettings = ref(false)
 const accentColor = ref('#8b5cf6')
 const accentColor2 = ref('#ec4899')
+const accentSoft = ref('rgba(139, 92, 246, 0.22)')
+const accentGlow = ref('rgba(139, 92, 246, 0.45)')
+const accentInk = ref('#f4f5f4')
 
 // --- Color extraction ---
 function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
@@ -124,36 +125,6 @@ function withWhiteContrast(h: number, s: number, l: number): string {
   return hslToHex(h, s, l)
 }
 
-function extractAccent() {
-  const src = canvas.value!
-  const tmp = document.createElement('canvas')
-  tmp.width = 48; tmp.height = 48
-  const ctx = tmp.getContext('2d')!
-  ctx.drawImage(src, 0, 0, 48, 48)
-  const { data } = ctx.getImageData(0, 0, 48, 48)
-
-  let rAcc = 0, gAcc = 0, bAcc = 0, wTotal = 0
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i]! / 255, g = data[i + 1]! / 255, b = data[i + 2]! / 255
-    const max = Math.max(r, g, b)
-    const sat = max === 0 ? 0 : (max - Math.min(r, g, b)) / max
-    const w = sat * sat
-    rAcc += r * w; gAcc += g * w; bAcc += b * w; wTotal += w
-  }
-
-  if (colorMode.value === 'bw') {
-    accentColor.value  = withWhiteContrast(0, 0, 0.6)
-    accentColor2.value = withWhiteContrast(0, 0, 0.75)
-    return
-  }
-
-  if (wTotal < 0.1) return  // near-greyscale, keep current accent
-
-  const r = rAcc / wTotal, g = gAcc / wTotal, b = bAcc / wTotal
-  const [h, s] = rgbToHsl(r, g, b)
-  accentColor.value  = withWhiteContrast(h, Math.max(s, 0.65), 0.6)
-  accentColor2.value = withWhiteContrast((h + 38) % 360, Math.max(s, 0.65), 0.6)
-}
 
 let gl: WebGL2RenderingContext | null = null
 let vs: WebGLShader | null = null
@@ -203,8 +174,7 @@ function mulberry32(s: number): Rng {
   }
 }
 function makeRng(): Rng {
-  if (!seedEnabled.value) seedValue.value = Math.floor(Math.random() * 0xFFFFFFFF)
-  return mulberry32(seedValue.value)
+  return seedEnabled.value ? mulberry32(seedValue.value) : Math.random
 }
 function randn(rng: Rng): number {
   const u = 1 - rng(), v = rng()
@@ -246,11 +216,6 @@ function lerpZ(a: number[], b: number[], t: number): number[] {
   return a.map((v, i) => v + (b[i]! - v) * t)
 }
 function smoothstep(t: number) { return t * t * t * (t * (t * 6 - 15) + 10) }
-
-function debounce<T extends (...args: never[]) => void>(fn: T, ms: number): T {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  return ((...args: Parameters<T>) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms) }) as T
-}
 
 // --- Pack weights ---
 function packWeights(layers: Layer[]): Float32Array {
@@ -787,17 +752,92 @@ function draw(z: number[]) {
   }
 }
 
+function inkOn(rgbCss: string): string {
+  const nums = rgbCss.match(/-?\d+(\.\d+)?/g)?.map(Number) ?? [139, 92, 246]
+  const lum = (0.2126 * (nums[0] ?? 0) + 0.7152 * (nums[1] ?? 0) + 0.0722 * (nums[2] ?? 0)) / 255
+  return lum > 0.55 ? '#0a0c0a' : '#f4f5f4'
+}
+
+function withAlpha(rgbCss: string, a: number): string {
+  const nums = rgbCss.match(/-?\d+(\.\d+)?/g)?.map(Number) ?? [139, 92, 246]
+  return `rgba(${nums[0] ?? 0},${nums[1] ?? 0},${nums[2] ?? 0},${a})`
+}
+
+function extractPalette(): { palette: string[]; accent: string; deep: string } {
+  const src = canvas.value!
+  const tmp = document.createElement('canvas')
+  tmp.width = 50; tmp.height = 50
+  const ctx = tmp.getContext('2d')!
+  ctx.drawImage(src, 0, 0, 50, 50)
+  const { data } = ctx.getImageData(0, 0, 50, 50)
+
+  const buckets: Array<{ score: number; hue: number; rgb: string } | null> = new Array(15).fill(null)
+  let deepMin = Infinity
+  let deepRgb = 'rgb(10,10,10)'
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i]! / 255, g = data[i + 1]! / 255, b = data[i + 2]! / 255
+    const brightness = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    if (brightness < deepMin && brightness > 0.02) {
+      deepMin = brightness
+      deepRgb = `rgb(${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)})`
+    }
+    const [h, s, l] = rgbToHsl(r, g, b)
+    if (s < 0.18 || l < 0.18 || l > 0.85) continue
+    const idx = Math.floor(h / 24) % 15
+    const score = s * (1 - Math.abs(l - 0.55) * 1.4)
+    if (!buckets[idx] || score > buckets[idx]!.score)
+      buckets[idx] = { score, hue: h, rgb: `rgb(${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)})` }
+  }
+
+  const sorted = (buckets.filter(Boolean) as Array<{ score: number; hue: number; rgb: string }>)
+    .sort((a, b) => b.score - a.score)
+  const palette: string[] = []
+  const chosen: number[] = []
+  for (const { rgb, hue } of sorted) {
+    if (palette.length >= 5) break
+    const close = chosen.some(ch => Math.min(Math.abs(hue - ch), 360 - Math.abs(hue - ch)) < 22)
+    if (!close) { palette.push(rgb); chosen.push(hue) }
+  }
+  return { palette, accent: palette[0] ?? 'rgb(139,92,246)', deep: deepRgb }
+}
+
 function captureBg() {
   // Defer toDataURL to next rAF: on Windows, reading GPU pixels synchronously
   // blocks the main thread even after gl.finish(), because the real GPU→CPU
   // transfer doesn't happen until the browser compositor releases the framebuffer.
   requestAnimationFrame(() => {
     if (!canvas.value) return
-    console.log('[GP] captureBg: toDataURL...')
-    const t0 = performance.now()
-    bgUrl.value = canvas.value.toDataURL('image/jpeg', 0.6)
-    console.log(`[GP] captureBg: done (${(performance.now()-t0).toFixed(1)}ms)`)
-    extractAccent()
+    const dataUrl = canvas.value.toDataURL('image/jpeg', 0.6)
+    bgUrl.value = dataUrl
+
+    if (ambientImg.value) ambientImg.value.src = dataUrl
+    if (haloInner.value) haloInner.value.style.backgroundImage = `url(${dataUrl})`
+    if (haloOuter.value) haloOuter.value.style.backgroundImage = `url(${dataUrl})`
+
+    if (colorMode.value === 'bw') {
+      accentColor.value = withWhiteContrast(0, 0, 0.6)
+      accentColor2.value = withWhiteContrast(0, 0, 0.75)
+      accentSoft.value = withAlpha('rgb(153,153,153)', 0.22)
+      accentGlow.value = withAlpha('rgb(153,153,153)', 0.45)
+      accentInk.value = '#0a0c0a'
+      return
+    }
+
+    const { palette, accent, deep } = extractPalette()
+    const root = document.documentElement
+    palette.forEach((c, i) => root.style.setProperty(`--c${i}`, c))
+    root.style.setProperty('--deep', deep)
+
+    accentSoft.value = withAlpha(accent, 0.22)
+    accentGlow.value = withAlpha(accent, 0.45)
+    accentInk.value = inkOn(accent)
+
+    const nums = accent.match(/-?\d+(\.\d+)?/g)?.map(Number) ?? [139, 92, 246]
+    const [rn, gn, bn] = [(nums[0] ?? 0) / 255, (nums[1] ?? 0) / 255, (nums[2] ?? 0) / 255]
+    const [h, s] = rgbToHsl(rn, gn, bn)
+    accentColor.value = withWhiteContrast(h, Math.max(s, 0.65), 0.6)
+    accentColor2.value = withWhiteContrast((h + 38) % 360, Math.max(s, 0.65), 0.6)
   })
 }
 
@@ -946,10 +986,6 @@ async function generate() {
   if (generating.value) return
   stopMorphing()
   morphingEnabled.value = false
-  if (hasGenerated.value && canvas.value) {
-    transitionImg.value = canvas.value.toDataURL('image/jpeg', 0.8)
-    showTransition.value = true
-  }
   generating.value = true
   await nextTick()
 
@@ -980,7 +1016,6 @@ async function generate() {
 
   generating.value = false
   hasGenerated.value = true
-  showTransition.value = false
 }
 
 // --- Morphing ---
@@ -1288,6 +1323,9 @@ function removeStop(i: number) {
 
 // --- Extract palette from uploaded image ---
 const imageInput = ref<HTMLInputElement | null>(null)
+const ambientImg = ref<HTMLImageElement | null>(null)
+const haloOuter = ref<HTMLElement | null>(null)
+const haloInner = ref<HTMLElement | null>(null)
 
 type RGB = [number, number, number]
 
@@ -1408,7 +1446,7 @@ watch(glassBlobCount, () => {
   glassBlobs = makeGlassBlobs(Math.random)
 })
 
-watch([glassEnabled, glassFrost, glassRefraction, glassSize, glassBlobCount, glassBlobSmooth], debounce(async () => {
+watch([glassEnabled, glassFrost, glassRefraction, glassSize, glassBlobCount, glassBlobSmooth], async () => {
   if (glassEnabled.value) {
     if (!isWindows && !glassProgram) buildGlassProgram()
     if (glassBlobs[2] === 0) glassBlobs = makeGlassBlobs(Math.random)
@@ -1417,23 +1455,23 @@ watch([glassEnabled, glassFrost, glassRefraction, glassSize, glassBlobCount, gla
   if (gpuDevice) { drawGPU(currentZ); captureBg() }
   else if (gl) { draw(currentZ); captureBg() }
   else { await renderWithWorker(currentWeights, currentZ) }
-}, 150))
+})
 
-watch([grainEnabled, grainLevel], debounce(async () => {
+watch([grainEnabled, grainLevel], async () => {
   if (animating) return
   if (gpuDevice) { drawGPU(currentZ) }
   else if (gl) { draw(currentZ) }
   else { await renderWithWorker(currentWeights, currentZ) }
-}, 150))
+})
 
 watch(aspectRatio, generate, { flush: 'post' })
 
-watch(stops, debounce(async () => {
+watch(stops, async () => {
   if (animating || !hasGenerated.value) return
   if (gpuDevice) { drawGPU(currentZ) }
   else if (gl) { draw(currentZ) }
   else { await renderWithWorker(currentWeights, currentZ) }
-}, 150), { deep: true })
+}, { deep: true })
 
 const isMobile = ref(typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false)
 let mq: MediaQueryList
@@ -1480,17 +1518,20 @@ onUnmounted(() => {
     '--accent2': accentColor2,
     '--accent-dim': accentColor + '26',
     '--accent-hover': accentColor + 'dd',
+    '--accent-soft': accentSoft,
+    '--accent-glow': accentGlow,
+    '--accent-ink': accentInk,
   }">
-    <div v-if="bgUrl" class="bg-blur" :style="{ backgroundImage: `url(${bgUrl})` }" />
+    <div class="ambient">
+      <img ref="ambientImg" class="ambient__img" alt="" />
+    </div>
     <main class="canvas-wrap">
-      <div class="canvas-container">
+      <div class="artframe">
+        <div ref="haloOuter" class="halo halo--outer"></div>
+        <div ref="haloInner" class="halo"></div>
         <div class="canvas-frame">
           <canvas ref="canvas" :width="canvasW*2" :height="canvasH*2" class="canvas" />
-          <Transition name="cross-fade">
-            <img v-if="showTransition" :src="transitionImg" class="canvas canvas-overlay" :key="transitionImg" />
-          </Transition>
         </div>
-        <div class="canvas-meta">{{ aspectRatio }} · seed {{ seedValue }}</div>
       </div>
     </main>
 
@@ -1674,7 +1715,7 @@ onUnmounted(() => {
             {{ downloading ? 'Preparing…' : '↓ Download' }}
           </button>
         </div>
-        <button class="btn-generate" @click="generate" :disabled="generating || morphingEnabled || downloading">
+        <button class="btn-generate" :class="{ 'is-generating': generating }" @click="generate" :disabled="generating || morphingEnabled || downloading">
           <span v-if="generating" class="spinner"></span>
           {{ generating ? 'Generating…' : 'Generate' }}
         </button>
@@ -1685,7 +1726,7 @@ onUnmounted(() => {
 
     <div class="mobile-bar">
       <button class="mbar-btn" @click="restorePrev" :disabled="!hasPrev || morphingEnabled">↩</button>
-      <button class="mbar-generate" @click="generate" :disabled="generating || morphingEnabled || downloading">
+      <button class="mbar-generate" :class="{ 'is-generating': generating }" @click="generate" :disabled="generating || morphingEnabled || downloading">
         <span v-if="generating" class="spinner"></span>
         {{ generating ? '…' : 'Generate' }}
       </button>
@@ -1718,6 +1759,9 @@ onUnmounted(() => {
   --radius: 8px;
   --radius-sm: 5px;
   --sidebar: 260px;
+  --t-fast: 240ms cubic-bezier(.2, .7, .2, 1);
+  --t-mid:  600ms cubic-bezier(.2, .7, .2, 1);
+  --t-slow: 1400ms cubic-bezier(.2, .7, .2, 1);
 
   display: flex;
   min-height: 100vh;
@@ -1727,15 +1771,40 @@ onUnmounted(() => {
   font-size: 14px;
 }
 
-/* ── Background blur ── */
-.bg-blur {
+/* ── Ambient background ── */
+.ambient {
   position: fixed;
-  inset: -5%;
-  background-size: cover;
-  background-position: center;
-  filter: blur(90px) brightness(0.22) saturate(1.4);
-  z-index: 0;
+  inset: 0;
   pointer-events: none;
+  z-index: 0;
+  overflow: hidden;
+}
+
+.ambient__img {
+  position: absolute;
+  inset: -20%;
+  width: 140%;
+  height: 140%;
+  object-fit: cover;
+  opacity: 0;
+  filter: blur(120px) saturate(1.35);
+  transform: scale(1.15);
+  transition: opacity var(--t-slow);
+  animation: drift 28s ease-in-out infinite alternate;
+}
+
+.ambient__img[src]:not([src=""]) { opacity: 0.55; }
+
+.ambient::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(120% 80% at 50% 50%, transparent 30%, rgba(0,0,0,.55) 75%, rgba(0,0,0,.85) 100%);
+}
+
+@keyframes drift {
+  0%   { transform: translate3d(-2%, -1%, 0) scale(1.15) rotate(0deg); }
+  100% { transform: translate3d(2%, 1.5%, 0) scale(1.22) rotate(2deg); }
 }
 
 /* ── Canvas ── */
@@ -1750,12 +1819,35 @@ onUnmounted(() => {
   z-index: 1;
 }
 
-.canvas-container {
+.artframe {
+  position: relative;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-  max-width: 50%;
+  align-items: center;
+  justify-content: center;
+}
+
+.halo {
+  position: absolute;
+  inset: -8%;
+  border-radius: 36px;
+  background-size: cover;
+  background-position: center;
+  filter: blur(80px) saturate(1.4);
+  opacity: 0.95;
+  transform: scale(1.05);
+  z-index: 0;
+}
+
+.halo--outer {
+  inset: -18%;
+  filter: blur(180px) saturate(1.6);
+  opacity: 0.6;
+  transform: scale(1.18);
+}
+
+.canvas-frame {
+  position: relative;
+  z-index: 2;
 }
 
 .canvas {
@@ -1764,54 +1856,41 @@ onUnmounted(() => {
   width: auto;
   height: auto;
   border-radius: var(--radius);
-  box-shadow: 0 0 80px rgba(139, 92, 246, 0.1), 0 8px 40px rgba(0, 0, 0, 0.7);
+  box-shadow: 0 0 80px var(--accent-soft), 0 8px 40px rgba(0, 0, 0, 0.7);
   display: block;
-}
-
-.canvas-meta {
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.35);
-  letter-spacing: 0.03em;
-  user-select: none;
-}
-
-.canvas-frame {
-  position: relative;
-  line-height: 0;
-  overflow: hidden;
-  border-radius: var(--radius);
-}
-
-.canvas-overlay {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  box-shadow: none;
-}
-
-.cross-fade-leave-active {
-  transition: opacity 0.45s ease, filter 0.45s ease;
-}
-.cross-fade-leave-to {
-  opacity: 0;
-  filter: blur(12px);
+  transition: box-shadow var(--t-mid);
 }
 
 /* ── Sidebar ── */
 .sidebar {
   width: var(--sidebar);
   flex-shrink: 0;
-  background: rgba(17, 17, 24, 0.6);
-  backdrop-filter: blur(40px) saturate(1.6);
-  -webkit-backdrop-filter: blur(40px) saturate(1.6);
+  background: linear-gradient(180deg, rgba(12,14,12,.42), rgba(8,10,8,.62));
+  backdrop-filter: blur(40px) saturate(1.4);
+  -webkit-backdrop-filter: blur(40px) saturate(1.4);
   border-left: 1px solid rgba(255, 255, 255, 0.06);
   display: flex;
   flex-direction: column;
   height: 100vh;
   position: sticky;
   top: 0;
+  z-index: 2;
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .sidebar { background: rgba(10, 12, 10, 0.92); }
+}
+
+.sidebar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.4;
+  transition: background var(--t-mid);
   z-index: 1;
 }
 
@@ -1828,7 +1907,8 @@ onUnmounted(() => {
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
-  transition: background-image 0.6s ease;
+  filter: drop-shadow(0 0 10px var(--accent-soft));
+  transition: background-image var(--t-mid), filter var(--t-mid);
 }
 
 .sidebar-body {
@@ -1904,9 +1984,10 @@ onUnmounted(() => {
   padding: 0;
   flex-shrink: 0;
   transition: all 0.15s;
+  box-shadow: inset 0 0 10px -3px var(--accent-glow);
 }
 
-.act-add-btn:hover { border-color: var(--accent); color: var(--accent); }
+.act-add-btn:hover { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 18px -4px var(--accent-glow), 0 0 0 1px var(--accent-soft); }
 
 /* ── Select ── */
 .select {
@@ -1923,10 +2004,11 @@ onUnmounted(() => {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b6b88'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 10px center;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, box-shadow var(--t-mid);
+  box-shadow: inset 0 0 16px -4px var(--accent-glow);
 }
 
-.select:focus { border-color: var(--accent); }
+.select:focus { border-color: var(--accent); box-shadow: inset 0 0 18px -4px var(--accent-glow), 0 0 0 1px var(--accent-soft); }
 
 /* ── Slider ── */
 .slider {
@@ -1947,11 +2029,11 @@ onUnmounted(() => {
   border-radius: 50%;
   background: var(--accent);
   cursor: pointer;
-  box-shadow: 0 0 0 3px var(--accent-dim);
-  transition: box-shadow 0.15s;
+  box-shadow: 0 0 0 3px var(--accent-dim), 0 0 16px -4px var(--accent-glow);
+  transition: box-shadow var(--t-mid);
 }
 
-.slider::-webkit-slider-thumb:hover { box-shadow: 0 0 0 5px var(--accent-dim); }
+.slider::-webkit-slider-thumb:hover { box-shadow: 0 0 0 5px var(--accent-dim), 0 0 24px -4px var(--accent-glow); }
 
 .slider::-moz-range-thumb {
   width: 14px;
@@ -1990,6 +2072,7 @@ onUnmounted(() => {
 .seg-btn.active {
   background: var(--accent);
   color: #fff;
+  box-shadow: inset 0 0 20px -4px var(--accent-glow), 0 0 8px -4px var(--accent-soft);
 }
 
 /* ── Color stops ── */
@@ -2011,7 +2094,11 @@ onUnmounted(() => {
   border-radius: var(--radius-sm);
   cursor: pointer;
   background: none;
+  transition: box-shadow var(--t-mid);
+  box-shadow: inset 0 0 16px -4px var(--accent-glow);
 }
+
+.color-swatch:hover { box-shadow: 0 0 20px -4px var(--accent-glow); }
 
 .stop-remove {
   position: absolute;
@@ -2050,6 +2137,7 @@ onUnmounted(() => {
   justify-content: center;
   padding: 0;
   transition: all 0.15s;
+  box-shadow: inset 0 0 16px -4px var(--accent-glow);
 }
 
 .palette-wrap {
@@ -2070,10 +2158,11 @@ onUnmounted(() => {
   letter-spacing: 0.04em;
   cursor: pointer;
   transition: all 0.15s;
+  box-shadow: inset 0 0 16px -4px var(--accent-glow);
 }
-.upload-img-btn:hover { border-color: var(--accent); color: var(--accent); }
+.upload-img-btn:hover { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 22px -4px var(--accent-glow), 0 0 0 1px var(--accent-soft); }
 
-.stop-add:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.stop-add:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 22px -4px var(--accent-glow), 0 0 0 1px var(--accent-soft); }
 .stop-add:disabled { opacity: 0.25; cursor: default; }
 
 /* ── Toggle ── */
@@ -2093,9 +2182,10 @@ onUnmounted(() => {
   background: var(--border);
   border-radius: 9px;
   cursor: pointer;
-  transition: background 0.2s;
+  transition: background 0.2s, box-shadow var(--t-mid);
   position: relative;
   flex-shrink: 0;
+  box-shadow: inset 0 0 10px -3px var(--accent-glow);
 }
 
 .toggle::after {
@@ -2110,7 +2200,7 @@ onUnmounted(() => {
   transition: transform 0.2s, background 0.2s;
 }
 
-.toggle-input:checked + .toggle { background: var(--accent); }
+.toggle-input:checked + .toggle { background: var(--accent); box-shadow: 0 0 10px -2px var(--accent-soft); }
 .toggle-input:checked + .toggle::after { transform: translateX(16px); background: #fff; }
 
 /* ── Ratio buttons ── */
@@ -2129,14 +2219,16 @@ onUnmounted(() => {
   color: var(--muted);
   transition: all 0.15s;
   padding: 0;
+  box-shadow: inset 0 0 16px -4px var(--accent-glow);
 }
 
-.ratio-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
+.ratio-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 22px -4px var(--accent-glow), 0 0 0 1px var(--accent-soft); }
 
 .ratio-btn.active {
   background: var(--accent-dim);
   border-color: var(--accent);
   color: var(--accent);
+  box-shadow: inset 0 0 20px -4px var(--accent-glow), 0 0 8px -4px var(--accent-soft);
 }
 
 /* ── Number input ── */
@@ -2149,10 +2241,11 @@ onUnmounted(() => {
   border-radius: var(--radius-sm);
   font-size: 13px;
   outline: none;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, box-shadow var(--t-mid);
+  box-shadow: inset 0 0 16px -4px var(--accent-glow);
 }
 
-.number-input:focus { border-color: var(--accent); }
+.number-input:focus { border-color: var(--accent); box-shadow: inset 0 0 18px -4px var(--accent-glow), 0 0 0 1px var(--accent-soft); }
 
 /* ── Actions ── */
 .actions {
@@ -2182,9 +2275,10 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   gap: 6px;
+  box-shadow: inset 0 0 16px -4px var(--accent-glow);
 }
 
-.btn-secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.btn-secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--text); box-shadow: inset 0 0 22px -4px var(--accent-glow), 0 0 0 1px var(--accent-soft); }
 .btn-secondary:disabled { opacity: 0.3; cursor: default; }
 
 .btn-generate {
@@ -2197,15 +2291,38 @@ onUnmounted(() => {
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.15s;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   letter-spacing: 0.1px;
+  position: relative;
+  box-shadow: 0 0 32px -6px var(--accent-soft);
 }
 
-.btn-generate:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-generate::after {
+  content: '';
+  position: absolute;
+  inset: -8px;
+  border-radius: calc(var(--radius-sm) + 8px);
+  box-shadow: 0 0 32px 4px var(--accent-glow);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.btn-generate.is-generating::after {
+  animation: ghost-pulse 1.8s ease-in-out infinite;
+}
+
+.btn-generate:hover:not(:disabled) {
+  background: var(--accent-hover);
+  box-shadow: 0 0 48px -4px var(--accent-soft);
+}
+
+.btn-generate:active:not(:disabled) {
+  box-shadow: 0 0 8px -2px var(--accent), 0 0 32px -4px var(--accent-soft);
+}
+
 .btn-generate:disabled { opacity: 0.45; cursor: default; }
 
 /* ── Spinner ── */
@@ -2221,12 +2338,59 @@ onUnmounted(() => {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Glow utilities ── */
+.glow {
+  box-shadow:
+    0 0 0 1px var(--accent-soft),
+    0 0 24px -4px var(--accent-soft),
+    0 0 48px -12px var(--accent-glow);
+  transition: box-shadow var(--t-mid);
+}
+
+.glow--soft { box-shadow: 0 0 16px -6px var(--accent-soft); transition: box-shadow var(--t-mid); }
+
+.glow--strong {
+  box-shadow:
+    0 0 0 1px var(--accent),
+    0 0 32px -2px var(--accent-soft),
+    0 0 80px -10px var(--accent-glow),
+    inset 0 0 24px -16px var(--accent);
+  transition: box-shadow var(--t-mid);
+}
+
+.text-glow {
+  text-shadow: 0 0 12px var(--accent-soft), 0 0 32px var(--accent-glow);
+  transition: text-shadow var(--t-mid);
+}
+
+.icon-glow {
+  filter: drop-shadow(0 0 6px var(--accent-soft)) drop-shadow(0 0 16px var(--accent-glow));
+  transition: filter var(--t-mid);
+}
+
+/* ── Keyframes ── */
+@keyframes ghost-pulse { 50% { opacity: 1; } }
+
+@keyframes accent-flash {
+  0%   { box-shadow: 0 0 0 0 var(--accent),      0 0 0 0   var(--accent-glow); }
+  30%  { box-shadow: 0 0 0 6px var(--accent-soft), 0 0 80px -6px var(--accent); }
+  100% { box-shadow: 0 0 0 0 transparent,        0 0 0 0   transparent; }
+}
+
 /* ── Accent transitions ── */
 .btn-generate,
 .seg-btn.active,
 .toggle-input:checked + .toggle,
 .ratio-btn.active,
-.slider::-webkit-slider-thumb { transition: background 0.5s ease, border-color 0.5s ease; }
+.slider::-webkit-slider-thumb,
+.field-value,
+.act-add-btn,
+.upload-img-btn,
+.ratio-btn,
+.btn-secondary {
+  transition: background var(--t-mid), color var(--t-mid),
+              border-color var(--t-mid), box-shadow var(--t-mid);
+}
 
 /* ── Fade transition ── */
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s, transform 0.15s; }
@@ -2360,12 +2524,13 @@ onUnmounted(() => {
     align-items: center;
     justify-content: center;
     transition: all 0.15s;
+    box-shadow: inset 0 0 16px -4px var(--accent-glow);
   }
 
   .mbar-btn:disabled { opacity: 0.3; cursor: default; }
-  .mbar-btn:not(:disabled):active { opacity: 0.7; }
+  .mbar-btn:not(:disabled):active { opacity: 0.7; box-shadow: inset 0 0 20px -4px var(--accent-glow), 0 0 8px -4px var(--accent-soft); }
 
-  .mbar-settings.active { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+  .mbar-settings.active { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); box-shadow: inset 0 0 20px -4px var(--accent-glow), 0 0 8px -4px var(--accent-soft); }
 
   .mbar-generate {
     flex: 1;
@@ -2381,8 +2546,23 @@ onUnmounted(() => {
     align-items: center;
     justify-content: center;
     gap: 7px;
-    transition: background 0.15s;
     font-family: inherit;
+    position: relative;
+    box-shadow: 0 0 24px -6px var(--accent-soft);
+  }
+
+  .mbar-generate::after {
+    content: '';
+    position: absolute;
+    inset: -6px;
+    border-radius: calc(var(--radius-sm) + 6px);
+    box-shadow: 0 0 24px 4px var(--accent-glow);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .mbar-generate.is-generating::after {
+    animation: ghost-pulse 1.8s ease-in-out infinite;
   }
 
   .mbar-generate:disabled { opacity: 0.45; cursor: default; }
